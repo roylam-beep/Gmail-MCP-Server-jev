@@ -34,3 +34,5 @@ credentials.json
 .gcp-oauth.keys.json
 # Local scratch (browser-agent screenshots etc.)
 tmp/
+# npm pack output — build artifacts, never committed
+*.tgz

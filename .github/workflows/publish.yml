@@ -39,7 +39,22 @@ jobs:
       - run: npm install -g npm@latest
       - run: npm ci
       - run: npm test
-      - run: npm publish --access public
+      # npm cannot register a trusted publisher for a package that does not
+      # exist yet (npm/cli#8544), so a brand-new package's first version has to
+      # be published by hand. Without this guard the tag that follows fails on
+      # "cannot publish over the previously published version" and takes the
+      # mcp-registry job down with it, because that job `needs: npm`.
+      # It also makes re-running a release tag safe after a partial failure.
+      - name: Publish to npm (skip if this version is already there)
+        run: |
+          set -euo pipefail
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION is already on npm — nothing to publish."
+            exit 0
+          fi
+          npm publish --access public
 
   mcp-registry:
     needs: npm
