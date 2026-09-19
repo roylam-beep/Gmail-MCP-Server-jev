@@ -1113,6 +1113,11 @@ A cc-only or bcc-only send is valid: `to` may be empty as long as `cc` or `bcc` 
    - A custom callback URL must match one of the authorized redirect URIs registered in the Google Cloud Console
    - `auth` reports `EADDRINUSE` and `EACCES` with the port and the fix instead of exiting on an unhandled error. A callback URL with no port defaults to 80, which needs elevated privileges — give it an explicit high port
 
+6. **Authentication ended before you finished signing in**
+   - Reloading the callback URL, a browser prefetch, or opening it by hand no longer aborts the run: a hit carrying neither a code nor an error is answered with 400 and the listener keeps waiting
+   - Declining the Google consent screen ends the run with `Authentication failed: Authentication was declined on the Google consent screen.` — re-run `auth` and accept
+   - The flow times out after 10 minutes if the consent redirect never arrives
+
 4. **Batch Operation Failures**
    - Per-message endpoints (`batch_modify_emails`, `batch_delete_emails`) settle each message independently; a failure is reported for that message only and its siblings are never re-issued
    - `batch_report_phishing` uses Gmail's batch endpoint and retries a failed chunk one message at a time

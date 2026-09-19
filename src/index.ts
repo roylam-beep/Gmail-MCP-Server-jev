@@ -290,11 +290,32 @@ async function authenticate(scopes: string[]) {
 
             const url = new URL(req.url, callbackUrl.origin);
             const code = url.searchParams.get('code');
+            // Google reports a refused or failed consent by redirecting here
+            // with ?error=..., never with a code.
+            const oauthError = url.searchParams.get('error');
+
+            if (oauthError) {
+                const description = url.searchParams.get('error_description');
+                res.writeHead(400);
+                res.end(`Authentication failed: ${oauthError}. You can close this window.`);
+                finish(new Error(
+                    oauthError === 'access_denied'
+                        ? 'Authentication was declined on the Google consent screen.'
+                        : `Google returned an OAuth error: ${oauthError}${description ? ` (${description})` : ''}`,
+                ));
+                return;
+            }
 
             if (!code) {
+                // A hit on the callback path carrying neither a code nor an
+                // error is not the consent redirect — it is a reload, a
+                // prefetch, or someone opening the URL by hand. Ending the run
+                // here meant a stray browser request aborted `auth` with
+                // "No code provided" and the whole flow had to be restarted.
+                // Answer and keep listening; the timeout above still bounds it.
                 res.writeHead(400);
-                res.end('No code provided');
-                finish(new Error('No code provided'));
+                res.end('Waiting for the Google consent redirect. Complete sign-in in the tab that opened.');
+                console.error(`Ignoring a request to ${callbackUrl.pathname} with no authorization code — still waiting for the consent redirect.`);
                 return;
             }
 
@@ -349,7 +370,16 @@ async function main() {
             console.error('Available scopes:', getAvailableScopeNames().join(', '));
         }
 
-        await authenticate(scopes);
+        // The ways auth fails are all expected conditions a user can act on —
+        // a declined consent screen, a busy port, a timeout. Reporting them
+        // through main()'s catch labelled them "Server error" and printed a
+        // stack trace, which buries the one line that says what to do.
+        try {
+            await authenticate(scopes);
+        } catch (error) {
+            console.error(`Authentication failed: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+        }
         console.error('Authentication completed successfully');
         process.exit(0);
     }
