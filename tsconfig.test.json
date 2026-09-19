@@ -1,0 +1,14 @@
+{
+  // Nothing type-checks the test files: tsconfig.json excludes them so they
+  // never enter the tsc program, and vitest strips types with esbuild without
+  // checking them. `npm run typecheck` went green while a test could call a
+  // renamed export, pass a wrong type, or hold a stale @ts-expect-error — only
+  // a runtime blow-up would catch it.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

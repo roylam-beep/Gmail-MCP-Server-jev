@@ -9,9 +9,16 @@ services:
       - mcp-gmail:/gmail-server
     environment:
       - GMAIL_CREDENTIALS_PATH=/gmail-server/credentials.json
-    ports:
-      - "3000:3000"
-    restart: unless-stopped
+    # This server speaks MCP over stdio: the client owns the process and pipes
+    # to it. There is no port to publish — the only listener it ever opens is
+    # the OAuth callback during `auth`, bound to 127.0.0.1 inside the
+    # container, which a published port could not reach anyway.
+    #
+    # `restart: unless-stopped` was worse than useless here: started without a
+    # client on stdin the transport reads EOF and exits, and the restart policy
+    # brought it straight back — a crash loop.
+    stdin_open: true
+    tty: false
 
 volumes:
   mcp-gmail:

@@ -17,7 +17,7 @@ Heuristics:
 - **MISMATCH (default decline + redirect to klodr fork):** new feature surface the maintainer wouldn't use daily, new dependencies, infra/deployment expansion (Docker images, hosting), hardening classes the local threat model explicitly excludes (see Security Standards below), capabilities with an existing simple workaround (e.g. registering the server twice ≈ multi-account).
 - **NEUTRAL:** repo hygiene, triage, support/environmental issues, distribution of the existing lean server.
 
-MISMATCH handling: don't build it, don't merge it. **Pitch the item to the maintainer FIRST (angry-king style) and close only after his explicit call** - never auto-close a contributor's PR/issue on philosophy grounds alone (inherited upstream policy: outward-facing closures are the maintainer's judgment, MISMATCH verdict or not). Once he says close: comment kindly, point to klodr/gmail-mcp, close.
+MISMATCH handling: don't build it, don't merge it. **Pitch the item to the maintainer FIRST and close only after their explicit call** - never auto-close a contributor's PR on philosophy grounds alone (inherited upstream policy: outward-facing closures are the maintainer's judgment, MISMATCH verdict or not). Once they say close: comment kindly, point to klodr/gmail-mcp, close.
 
 ## Branch Workflow
 
@@ -57,7 +57,7 @@ Published as **@geniushub/gmail-mcp** on npm + **io.github.roylam-beep/Gmail-MCP
 ### Step 3: Security Audit (Conditional)
 - Run it with the **`security-review` skill** available in this session. (An earlier version of this file named a `security-auditor` subagent; no such agent exists here, and a mandatory step with no runnable executor is a step that gets quietly skipped or faked.)
 - **Skip security audit for PRs with "help wanted" label that are still waiting for community testing/volunteers.** These PRs are parked - auditing them wastes resources. Report a one-liner instead: "PR #N: still waiting for community help, no action needed."
-- For all other PRs: run comprehensive security audit using `security-auditor` subagent.
+- For all other PRs: run a comprehensive security audit with the `security-review` skill.
 - Explicitly report verdict: "Security audit: **PASS**" or "Security audit: **FAIL** - [findings]"
 - Never present a PR review to user without a completed security audit (unless skipped per above).
 - For FAIL verdicts: list all findings with severity (CRITICAL/HIGH/MEDIUM/LOW/INFO).

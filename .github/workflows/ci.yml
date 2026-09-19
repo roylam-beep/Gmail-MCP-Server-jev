@@ -223,6 +223,9 @@ jobs:
       - name: Audit dependencies
         run: npm audit --audit-level=critical
 
+      # Covers src/ and, via tsconfig.test.json, the test files — which nothing
+      # type-checked before: tsconfig.json excludes them and vitest strips
+      # types without checking them.
       - name: Typecheck
         run: npm run typecheck
 

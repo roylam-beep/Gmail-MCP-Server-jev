@@ -168,7 +168,11 @@ export const filterTemplates = {
      * Filter emails containing specific text
      */
     containingText: (searchText: string, labelIds: string[] = [], markImportant: boolean = false): { criteria: GmailFilterCriteria, action: GmailFilterAction } => ({
-        criteria: { query: `"${searchText}"` },
+        criteria: { // Gmail's query syntax has no escape for a double quote inside a
+            // quoted phrase, so wrapping raw text that contains one produced
+            // `"say "hi""` — a query that silently matches the wrong thing.
+            // Strip them rather than emit something broken.
+            query: `"${searchText.replace(/"/g, ' ').trim()}"` },
         action: {
             addLabelIds: markImportant ? [...labelIds, 'IMPORTANT'] : labelIds
         }

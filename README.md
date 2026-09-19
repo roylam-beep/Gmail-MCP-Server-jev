@@ -1177,4 +1177,4 @@ MIT
 
 ## Support
 
-If you encounter any issues or have questions, please [file an issue](https://github.com/roylam-beep/Gmail-MCP-Server-jev/issues).
+If you encounter any issues or have questions, please [open a pull request or a discussion](https://github.com/roylam-beep/Gmail-MCP-Server-jev/pulls) — the issue tracker is disabled on this fork.

@@ -1443,7 +1443,8 @@ async function main() {
                             filterConfig = filterTemplates.withAttachments(params.labelIds);
                             break;
                         case 'largeEmails':
-                            if (!params.sizeInBytes) throw new Error("sizeInBytes is required for largeEmails template");
+                            // `!0` is true, so a legal threshold of 0 was reported as missing.
+                            if (params.sizeInBytes === undefined) throw new Error("sizeInBytes is required for largeEmails template");
                             filterConfig = filterTemplates.largeEmails(params.sizeInBytes, params.labelIds);
                             break;
                         case 'containingText':
