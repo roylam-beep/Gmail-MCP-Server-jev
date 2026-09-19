@@ -154,14 +154,25 @@ describe('buildReplyAllRecipients', () => {
         expect(result.cc).not.toContain('me@example.com');
     });
 
-    it('excludes authenticated user from To when sender is self', () => {
+    it('promotes the other recipients to To when the sender is yourself', () => {
+        // Replying to a message you sent is ordinary — the last message in a
+        // thread is often your own, and some lists rewrite From to the
+        // subscriber. Leaving `to` empty made the caller report "Could not
+        // determine recipient for reply" on a message that plainly had one.
         const result = buildReplyAllRecipients(
             'me@example.com',
             'recipient@example.com',
             '',
             myEmail
         );
-        expect(result.to).toEqual([]);
+        expect(result.to).toEqual(['recipient@example.com']);
+        expect(result.cc).toEqual([]);
+        expect(result.to).not.toContain(myEmail);
+    });
+
+    it('still returns nothing when the only address is your own', () => {
+        expect(buildReplyAllRecipients('me@example.com', 'me@example.com', '', myEmail))
+            .toEqual({ to: [], cc: [] });
     });
 
     it('handles Name <email> format in From', () => {

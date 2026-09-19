@@ -13,20 +13,63 @@
  * @param headerValue - The raw header value (e.g., From, To, CC)
  * @returns Array of extracted email addresses
  */
+/** An addr-spec with no spaces and exactly one @, which is all a header needs. */
+function looksLikeAddress(value: string): boolean {
+    return /^[^\s@<>,;]+@[^\s@<>,;]+\.[^\s@<>,;]+$/.test(value);
+}
+
+/**
+ * Split on separators that are not inside quotes or angle brackets, so a comma
+ * inside a display name does not cut an address in half.
+ */
+function splitAddresses(headerValue: string): string[] {
+    const parts: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    let depth = 0;
+
+    for (let i = 0; i < headerValue.length; i++) {
+        const char = headerValue[i];
+        if (char === '\\' && i + 1 < headerValue.length) {
+            current += char + headerValue[i + 1];
+            i += 1;
+            continue;
+        }
+        if (char === '"') inQuotes = !inQuotes;
+        else if (!inQuotes && char === '<') depth += 1;
+        else if (!inQuotes && char === '>') depth = Math.max(0, depth - 1);
+
+        if (!inQuotes && depth === 0 && (char === ',' || char === ';')) {
+            parts.push(current);
+            current = '';
+            continue;
+        }
+        current += char;
+    }
+    parts.push(current);
+    return parts.map(p => p.trim()).filter(Boolean);
+}
+
 export function parseEmailAddresses(headerValue: string): string[] {
     if (!headerValue) return [];
 
     const emails: string[] = [];
-    const parts = headerValue.split(',');
 
-    for (const part of parts) {
-        const trimmed = part.trim();
-        // Extract email from "Name <email>" format
-        const match = trimmed.match(/<([^>]+)>/);
-        if (match) {
-            emails.push(match[1].trim());
-        } else if (trimmed.includes('@')) {
-            emails.push(trimmed);
+    for (const part of splitAddresses(headerValue)) {
+        // The real addr-spec is the LAST bracketed group. Taking the first let
+        // a display name decide where a reply went:
+        //   "Support <support@paypal.com>" <attacker@evil.example>
+        // resolved to support@paypal.com — not the sender. Display names are
+        // attacker-controlled on any platform that relays user text, and this
+        // is the function that decides where reply_all is addressed.
+        const bracketed = [...part.matchAll(/<([^>]*)>/g)].pop();
+        const candidate = (bracketed ? bracketed[1] : part).trim();
+
+        // Anything that is not a bare address is display-name debris, not a
+        // recipient. It used to be pushed through verbatim, and cc/bcc were
+        // never validated downstream, so it landed in the header as-is.
+        if (looksLikeAddress(candidate)) {
+            emails.push(candidate);
         }
     }
 
@@ -99,13 +142,38 @@ export function buildReplyAllRecipients(
     const ccEmails = parseEmailAddresses(originalCc);
 
     // TO recipients: original From (the person who sent the email), excluding myself
-    const replyTo = filterOutEmail(fromEmails, myEmail);
+    let replyTo = dedupe(filterOutEmail(fromEmails, myEmail));
 
     // CC recipients: everyone else who was on To and CC, excluding myself
-    const replyCc = filterOutEmail([...toEmails, ...ccEmails], myEmail);
+    let replyCc = dedupe(filterOutEmail([...toEmails, ...ccEmails], myEmail));
+
+    // Replying to a message you sent yourself is ordinary — the last message
+    // in a thread is often your own, and some lists rewrite From to the
+    // subscriber. That left `to` empty and the caller reported "Could not
+    // determine recipient for reply" on a message that plainly had recipients,
+    // because they were all sitting in cc. Promote them.
+    if (replyTo.length === 0 && replyCc.length > 0) {
+        replyTo = replyCc;
+        replyCc = [];
+    }
+
+    // An address on both To and Cc otherwise got two copies of the reply.
+    const inTo = new Set(replyTo.map(e => e.toLowerCase()));
+    replyCc = replyCc.filter(e => !inTo.has(e.toLowerCase()));
 
     return {
         to: replyTo,
         cc: replyCc
     };
+}
+
+/** Case-insensitive de-duplication, preserving first-seen order. */
+function dedupe(emails: string[]): string[] {
+    const seen = new Set<string>();
+    return emails.filter(email => {
+        const key = email.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
 }

@@ -3,6 +3,8 @@
  * Extracted for testability.
  */
 
+import { fallbackAttachmentName } from './filename-utils.js';
+
 /**
  * Total decoded size allowed across all re-attached parts of a forwarded
  * message. Gmail rejects sends above ~25 MB anyway; failing here produces a
@@ -94,9 +96,13 @@ export function collectForwardAttachments(payload: MessagePartLike | null | unde
 
             found.push({
                 attachmentId,
-                // Inline images frequently have no filename; fall back to the cid
-                // so the part still gets a sane name in the forwarded message.
-                filename: part.filename || cid || 'attachment',
+                // Inline images frequently have no filename; fall back to the
+                // cid, then to the attachment id. A literal 'attachment' gave
+                // every filename-less part the SAME name, so forwarding a
+                // message with two of them (Outlook multipart/related using
+                // Content-Location, S/MIME signature parts) produced files
+                // that overwrite each other when the recipient saves them.
+                filename: part.filename || cid || fallbackAttachmentName(attachmentId),
                 mimeType: part.mimeType || 'application/octet-stream',
                 size: part.body?.size || 0,
                 ...(cid ? { cid } : {}),

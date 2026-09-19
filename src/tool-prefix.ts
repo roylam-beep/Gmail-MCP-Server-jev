@@ -16,6 +16,10 @@
  * @returns the resolved prefix, or `''` when none is configured
  */
 export function resolveToolPrefix(args: string[], env: NodeJS.ProcessEnv): string {
+    return validatePrefix(readPrefix(args, env));
+}
+
+function readPrefix(args: string[], env: NodeJS.ProcessEnv): string {
     for (let i = 0; i < args.length; i++) {
         const arg = args[i] ?? '';
         if (arg.startsWith('--tool-prefix=')) {
@@ -26,4 +30,21 @@ export function resolveToolPrefix(args: string[], env: NodeJS.ProcessEnv): strin
         }
     }
     return env.GMAIL_MCP_TOOL_PREFIX || '';
+}
+
+/**
+ * MCP tool names must match `^[a-zA-Z0-9_-]{1,128}$`. Nothing validated the
+ * prefix, so `--tool-prefix=gmail.` or a stray trailing space produced tool
+ * names every client rejects wholesale: the server starts, advertises them,
+ * and the user simply sees no tools with nothing anywhere naming the prefix as
+ * the reason.
+ */
+function validatePrefix(prefix: string): string {
+    if (prefix && !/^[a-zA-Z0-9_-]+$/.test(prefix)) {
+        throw new Error(
+            `Invalid tool prefix ${JSON.stringify(prefix)}: MCP tool names allow only letters, ` +
+            `digits, "_" and "-". Try "${prefix.replace(/[^a-zA-Z0-9_-]/g, '_')}".`,
+        );
+    }
+    return prefix;
 }

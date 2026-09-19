@@ -177,8 +177,14 @@ export const filterTemplates = {
     /**
      * Filter mailing list emails (common patterns)
      */
-    mailingList: (listIdentifier: string, labelIds: string[] = [], archive: boolean = true): { criteria: GmailFilterCriteria, action: GmailFilterAction } => ({
-        criteria: { query: `list:${listIdentifier} OR subject:[${listIdentifier}]` },
+    // archive defaults to FALSE. It was the only template defaulting to true,
+    // the schema marks the parameter optional without saying so, and the tool
+    // is annotated destructiveHint: false — so omitting it quietly built a
+    // filter that pulls mail out of the inbox. The identifier is quoted
+    // because Gmail treats a bare space as AND, so an unquoted "Django Users"
+    // matched far more than intended and archived all of it.
+    mailingList: (listIdentifier: string, labelIds: string[] = [], archive: boolean = false): { criteria: GmailFilterCriteria, action: GmailFilterAction } => ({
+        criteria: { query: `list:"${listIdentifier}" OR subject:"[${listIdentifier}]"` },
         action: {
             addLabelIds: labelIds,
             removeLabelIds: archive ? ['INBOX'] : undefined

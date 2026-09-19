@@ -27,14 +27,33 @@ jobs:
           # %B = full commit message (subject + body), so [skip-readme] is honored
           # wherever it appears — matching the CI error text and the README docs,
           # which both say "commit message" (not "subject line").
-          COMMIT_MSG=$(git log -1 --format=%B)
+          #
+          # Scan EVERY commit in the push, not just the tip. The diff below
+          # spans the whole range, so reading one commit meant putting the flag
+          # on the commit that actually changed source did not count if another
+          # commit followed it — a rule you could not satisfy without rewriting
+          # the tip's message.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            COMMIT_MSG=$(git log --format=%B "origin/${{ github.base_ref }}..HEAD" 2>/dev/null || git log -1 --format=%B)
+          elif [ -n "${{ github.event.before }}" ] && git rev-parse -q --verify "${{ github.event.before }}^{commit}" >/dev/null 2>&1; then
+            COMMIT_MSG=$(git log --format=%B "${{ github.event.before }}..HEAD")
+          else
+            COMMIT_MSG=$(git log -1 --format=%B)
+          fi
           # Skip on explicit flag
           if echo "$COMMIT_MSG" | grep -qiE '\[(skip-readme|no-readme)\]'; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           elif echo "$PR_TITLE" | grep -qiE '\[(skip-readme|no-readme)\]'; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-          # Skip on merge commits (experimental → main promotions already checked on experimental)
-          elif echo "$COMMIT_MSG" | grep -qiE '^Merge branch'; then
+          # Skip on merge commits: whatever they bring in was already checked on
+          # the branch. GitHub writes "Merge pull request #N from ..." — the old
+          # pattern only matched "Merge branch", so a PR that CI had just
+          # cleared via its [skip-readme] title was blocked again the moment it
+          # landed on main, by a commit message nobody wrote and nobody could
+          # edit.
+          elif git rev-parse -q --verify HEAD^2 >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif echo "$COMMIT_MSG" | grep -qiE '^Merge (branch|pull request|remote-tracking)'; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -46,8 +65,18 @@ jobs:
         env:
           BEFORE_SHA: ${{ github.event.before }}
         run: |
-          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
-            DIFF_RANGE="HEAD~1..HEAD"
+          # A force-push leaves github.event.before pointing at a commit that is
+          # no longer reachable. `git diff` then failed, `|| true` swallowed it,
+          # and the step reported "No shipped source changes" and passed — a
+          # green check whose stated reason was not the real one.
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ] \
+             || ! git rev-parse -q --verify "$BEFORE_SHA^{commit}" >/dev/null 2>&1; then
+            if git rev-parse -q --verify HEAD~1 >/dev/null 2>&1; then
+              DIFF_RANGE="HEAD~1..HEAD"
+            else
+              echo "No previous commit to compare against — README check skipped."
+              exit 0
+            fi
           else
             DIFF_RANGE="$BEFORE_SHA..HEAD"
           fi

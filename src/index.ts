@@ -28,6 +28,34 @@ import { processItemsIndividually, processBatchesWithFallback, mapWithConcurrenc
 import { extractEmailContent, extractAttachments, findAttachmentFilename, GmailMessagePart } from "./mime-utils.js";
 import { ensureSecureDirFor, hardenFilePermissions, writeSecretJsonAtomic } from "./secure-store.js";
 
+/**
+ * Turn an API failure into something the caller can act on.
+ *
+ * Google reports an expired or revoked grant as a bare `invalid_grant` or
+ * `invalid_client`, and insufficient scopes as a 403 that does not say which
+ * scope is missing. Passed through verbatim those name the symptom and leave
+ * an LLM client with nothing to do but retry. A project left in "Testing"
+ * publishing status — which the README's own setup produces — expires its
+ * refresh tokens every 7 days, so this is a weekly event for many users.
+ */
+function describeToolError(error: any): string {
+    const message = String(error?.message ?? error);
+    const code = error?.response?.data?.error ?? '';
+    const status = error?.code ?? error?.response?.status;
+
+    if (/invalid_grant|invalid_client/.test(`${message} ${code}`)) {
+        return `Error: Gmail credentials are no longer valid (${message}). Re-run \`auth\` to sign in again. ` +
+               `OAuth projects still in "Testing" publishing status expire refresh tokens after 7 days.`;
+    }
+
+    if (status === 401 || /insufficient authentication scopes|insufficientPermissions/i.test(message)) {
+        return `Error: this account is not authorized for that operation (${message}). ` +
+               `Re-run \`auth --scopes=...\` with the scope the tool needs.`;
+    }
+
+    return `Error: ${message}`;
+}
+
 // stdout is reserved for the MCP JSON-RPC stream (StdioServerTransport).
 // Anything written there that is not a protocol frame corrupts the session for
 // the client, so every diagnostic in this file goes to stderr — console.log is
@@ -52,6 +80,13 @@ const TOOL_PREFIX = resolveToolPrefix(process.argv.slice(2), process.env);
 let oauth2Client: OAuth2Client;
 let authorizedScopes: string[] = DEFAULT_SCOPES;
 let callbackUrl: URL;
+/**
+ * Whether usable credentials were loaded. Without this the server advertises
+ * every tool on a never-authenticated install and each call fails with
+ * google-auth-library's internal "No access, refresh token, API key or refresh
+ * handler callback is set." — which never mentions Gmail, credentials or auth.
+ */
+let hasStoredCredentials = false;
 
 /**
  * Extract common headers from Gmail message payload
@@ -104,11 +139,22 @@ async function loadCredentials() {
             process.exit(1);
         }
 
-        const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
+        // Its own message: a parse failure here used to surface as the generic
+        // "Error loading credentials", which names the wrong file.
+        let keysContent: any;
+        try {
+            keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
+        } catch (error: any) {
+            console.error(
+                `Error: could not read the OAuth keys at ${OAUTH_PATH} (${error.message}). ` +
+                `Re-download gcp-oauth.keys.json from the Google Cloud console and put it there.`,
+            );
+            process.exit(1);
+        }
         const keys = keysContent.installed || keysContent.web;
 
         if (!keys) {
-            console.error('Error: Invalid OAuth keys file format. File should contain either "installed" or "web" credentials.');
+            console.error(`Error: ${OAUTH_PATH} is not an OAuth keys file — it must contain an "installed" or "web" object.`);
             process.exit(1);
         }
 
@@ -119,7 +165,15 @@ async function loadCredentials() {
             arg.startsWith('http://') || arg.startsWith('https://')
         );
         const callback = callbackArg || "http://localhost:3000/oauth2callback";
-        callbackUrl = new URL(callback);
+        try {
+            callbackUrl = new URL(callback);
+        } catch {
+            console.error(
+                `Error: "${callback}" is not a valid callback URL. ` +
+                `Pass one like http://localhost:3000/oauth2callback, or omit it to use that default.`,
+            );
+            process.exit(1);
+        }
 
         // The built-in listener is plain HTTP. An https:// callback is only valid
         // in the documented reverse-proxy setup (README "Cloud Server Authentication"),
@@ -135,7 +189,8 @@ async function loadCredentials() {
             callback
         );
 
-        if (fs.existsSync(CREDENTIALS_PATH)) {
+        hasStoredCredentials = fs.existsSync(CREDENTIALS_PATH);
+        if (hasStoredCredentials) {
             // Credentials written before this check (or with a permissive umask)
             // stay world-readable, and writeFileSync's `mode` never revisits an
             // existing file. Tighten on every start.
@@ -143,7 +198,23 @@ async function loadCredentials() {
                 console.error(`Tightened permissions on ${CREDENTIALS_PATH} to 0600.`);
             }
 
-            const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
+            // credentials.json is a token CACHE, not configuration. Losing it
+            // costs one `auth` run. Exiting on an unreadable one was worse than
+            // it not existing at all — and because loadCredentials() runs
+            // before the `auth` subcommand is dispatched, it blocked the very
+            // command that repairs it. A truncated file is what a pre-atomic
+            // -write build left behind on an interrupted write.
+            let credentials: any;
+            try {
+                credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
+            } catch (error: any) {
+                console.error(
+                    `Saved credentials at ${CREDENTIALS_PATH} could not be read (${error.message}) — ignoring them. ` +
+                    `Run \`auth\` to sign in again.`,
+                );
+                hasStoredCredentials = false;
+                return;
+            }
 
             // Credentials file structure (v1.2.0+):
             //   { "tokens": { access_token, refresh_token, ... }, "scopes": ["gmail.readonly", ...] }
@@ -354,9 +425,33 @@ async function main() {
         const scopesArg = process.argv.find(arg => arg.startsWith('--scopes='));
         let scopes = DEFAULT_SCOPES;
 
+        // `--scopes gmail.readonly` (space-separated) matched nothing here, so
+        // the run silently fell through to DEFAULT_SCOPES — which is WIDER
+        // than what was asked for — and then printed "No --scopes flag
+        // specified" at someone who had specified it. --tool-prefix does accept
+        // the space form, so the guess is a reasonable one to make.
+        if (!scopesArg && process.argv.some(arg => arg === '--scopes' || arg === '--scope')) {
+            console.error('Error: --scopes needs the "=" form, e.g. --scopes=gmail.readonly');
+            console.error('Available scopes:', getAvailableScopeNames().join(', '));
+            process.exit(1);
+        }
+
         if (scopesArg) {
             const scopesValue = scopesArg.slice('--scopes='.length);
             scopes = parseScopes(scopesValue);
+
+            // An empty or whitespace-only value parsed to [], which
+            // validateScopes calls valid — nothing was invalid. That sent
+            // `scope=` to Google, whose consent page never redirects back, so
+            // auth sat for the full 10-minute timeout and then blamed the
+            // consent screen. If it had somehow completed, the saved scopes
+            // would be [] and every tool would disappear.
+            if (scopes.length === 0) {
+                console.error('Error: --scopes was given with no value. Pass at least one, e.g. --scopes=gmail.readonly');
+                console.error('Available scopes:', getAvailableScopeNames().join(', '));
+                process.exit(1);
+            }
+
             const validation = validateScopes(scopes);
 
             if (!validation.valid) {
@@ -474,6 +569,19 @@ async function main() {
             ? rawName.slice(TOOL_PREFIX.length)
             : rawName;
         const name = getToolByName(stripped) ? stripped : rawName;
+
+        // Every tool needs credentials. Saying so here beats letting each call
+        // fail deep inside google-auth-library with a message that never names
+        // Gmail, the credentials file, or the command that fixes it.
+        if (!hasStoredCredentials) {
+            return {
+                content: [{
+                    type: "text",
+                    text: `Error: Not authenticated. No Gmail credentials at ${CREDENTIALS_PATH}. ` +
+                          `Run \`npx @geniushub/gmail-mcp auth\` as the same user this server runs as, then restart it.`,
+                }],
+            };
+        }
 
         // Verify the tool is authorized for the current scopes
         // This guards against direct tool calls that bypass ListTools
@@ -1193,7 +1301,12 @@ async function main() {
                         labelListVisibility: validatedArgs.labelListVisibility,
                     });
 
-                    const action = result.type === 'user' && result.name === validatedArgs.name ? 'found existing' : 'created new';
+                    // Inferring this from the label's shape got it exactly
+                    // backwards: a newly created label comes back type 'user'
+                    // with the requested name, and findLabelByName matches
+                    // case-insensitively so a hit on "Invoices" for a request
+                    // of "invoices" failed the name comparison.
+                    const action = result.created ? 'created new' : 'found existing';
                     
                     return {
                         content: [
@@ -1351,7 +1464,14 @@ async function main() {
                         content: [
                             {
                                 type: "text",
-                                text: `Filter created from template '${template}':\nID: ${result.id}\nTemplate used: ${template}`,
+                                text: `Filter created from template '${template}':\nID: ${result.id}\n`
+                                    + `Query: ${filterConfig.criteria.query ?? '(none)'}\n`
+                                    // create_filter reports its full criteria and
+                                    // action; this one named only the template, so
+                                    // a filter that removes INBOX said nothing
+                                    // about doing it.
+                                    + `Adds labels: ${filterConfig.action.addLabelIds?.join(', ') || '(none)'}\n`
+                                    + `Removes labels: ${filterConfig.action.removeLabelIds?.join(', ') || '(none)'}`,
                             },
                         ],
                     };
@@ -1767,19 +1887,36 @@ async function main() {
 
                     // Carry attachments and inline images over unless opted out.
                     const rawAttachments: Array<Record<string, unknown>> = [];
+                    const skippedAttachments: string[] = [];
                     if (validatedArgs.includeAttachments) {
                         const refs = collectForwardAttachments(payload);
                         assertForwardAttachmentsWithinLimit(refs);
 
                         for (const ref of refs) {
-                            const attachment = await gmail.users.messages.attachments.get({
-                                userId: 'me',
-                                messageId: validatedArgs.messageId,
-                                id: ref.attachmentId,
-                            });
+                            // A transient 5xx or 429 on ONE attachment used to
+                            // abort the whole forward and discard every part
+                            // already fetched. Skipping it and saying so gets
+                            // the mail out, which is what includeAttachments:
+                            // false already offers for the same situation.
+                            let attachment;
+                            try {
+                                attachment = await gmail.users.messages.attachments.get({
+                                    userId: 'me',
+                                    messageId: validatedArgs.messageId,
+                                    id: ref.attachmentId,
+                                });
+                            } catch (error: any) {
+                                skippedAttachments.push(`${ref.filename} (${error.message})`);
+                                continue;
+                            }
 
                             const data = attachment.data.data;
-                            if (!data) continue;
+                            if (!data) {
+                                // Silently dropping this one still reported a
+                                // full carry-over count to the caller.
+                                skippedAttachments.push(`${ref.filename} (no data returned)`);
+                                continue;
+                            }
 
                             rawAttachments.push({
                                 filename: ref.filename,
@@ -1818,7 +1955,10 @@ async function main() {
                         content: [
                             {
                                 type: "text",
-                                text: `Email forwarded successfully!\nTo: ${validatedArgs.to.join(', ')}${validatedArgs.cc?.length ? `\nCC: ${validatedArgs.cc.join(', ')}` : ''}\nSubject: ${addFwdPrefix(subject)}\nAttachments carried over: ${rawAttachments.length}`,
+                                text: `Email forwarded successfully!\nTo: ${validatedArgs.to.join(', ')}${validatedArgs.cc?.length ? `\nCC: ${validatedArgs.cc.join(', ')}` : ''}\nSubject: ${addFwdPrefix(subject)}\nAttachments carried over: ${rawAttachments.length}`
+                                    + (skippedAttachments.length
+                                        ? `\nAttachments skipped (${skippedAttachments.length}): ${skippedAttachments.join('; ')}`
+                                        : ''),
                             },
                         ],
                     };
@@ -1862,7 +2002,7 @@ async function main() {
                 content: [
                     {
                         type: "text",
-                        text: `Error: ${error.message}`,
+                        text: describeToolError(error),
                     },
                 ],
             };

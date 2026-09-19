@@ -539,7 +539,13 @@ export const toolDefinitions: ToolDefinition[] = [
     name: "reply_all",
     description: "Replies to all recipients of an email. Automatically fetches the original email to build the recipient list (To, CC) and sets proper threading headers.",
     schema: ReplyAllSchema,
-    scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
+    // Reads the original message and the user's profile before it sends, and
+    // neither gmail.send nor gmail.compose grants read. Listing those made the
+    // tool visible on a send-only grant and then fail with Google's
+    // "insufficient authentication scopes" — a 403 that contradicts the guard
+    // the server had just applied. gmail.modify (and gmail.full, which covers
+    // it) is the only scope that grants both halves.
+    scopes: ["gmail.modify"],
     annotations: { title: "Reply All", destructiveHint: false },
   },
 
@@ -548,7 +554,8 @@ export const toolDefinitions: ToolDefinition[] = [
     name: "forward_email",
     description: "Forwards an existing email to new recipients. Fetches the original message, prepends the standard 'Forwarded message' header block, and carries attachments and inline images over by default.",
     schema: ForwardEmailSchema,
-    scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
+    // Same as reply_all: it reads the original message before sending it on.
+    scopes: ["gmail.modify"],
     annotations: { title: "Forward Email", destructiveHint: false },
   },
 ];

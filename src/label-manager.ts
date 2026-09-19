@@ -19,6 +19,33 @@ export interface GmailLabel {
 }
 
 /**
+ * Turn a Gmail API failure into something the caller can act on.
+ *
+ * Every catch here collapsed to `Failed to X: ${error.message}`, which drops
+ * the status and with it the only actionable part: a 403 means re-authenticate
+ * with a wider scope, a 429 or 503 means retry. getOrCreateLabel stacked three
+ * of those prefixes onto one sentence.
+ */
+function describeLabelError(operation: string, error: any): Error {
+    // Already one of ours — do not wrap it again.
+    if (error instanceof Error && !(error as any).code && !(error as any).status) {
+        return error;
+    }
+
+    const status = error?.status ?? error?.code;
+    if (status === 403) {
+        return new Error(
+            `Cannot ${operation}: this account is not authorized for label changes. ` +
+            `Re-run \`auth --scopes=gmail.modify,gmail.labels\`.`,
+        );
+    }
+    if (status === 429 || status === 503) {
+        return new Error(`Cannot ${operation}: Gmail is throttling or unavailable (HTTP ${status}) — retry shortly.`);
+    }
+    return new Error(`Failed to ${operation}${status ? ` (HTTP ${status})` : ''}: ${error?.message ?? error}`);
+}
+
+/**
  * Creates a new Gmail label
  * @param gmail - Gmail API instance
  * @param labelName - Name of the label to create
@@ -45,12 +72,18 @@ export async function createLabel(gmail: any, labelName: string, options: {
 
         return response.data;
     } catch (error: any) {
-        // Handle duplicate labels more gracefully
-        if (error.message && error.message.includes('already exists')) {
-            throw new Error(`Label "${labelName}" already exists. Please use a different name.`);
+        // Gmail answers a duplicate with HTTP 409 and the text "Label name
+        // exists or conflicts" — never "already exists", so this branch was
+        // dead and the user saw the raw API string instead. The status code
+        // was on the same object all along.
+        if (error.code === 409 || error.status === 409) {
+            throw new Error(
+                `Label "${labelName}" already exists, or collides with a reserved Gmail name. ` +
+                `Use get_or_create_label, or pick a different name.`,
+            );
         }
-        
-        throw new Error(`Failed to create label: ${error.message}`);
+
+        throw describeLabelError('create label', error);
     }
 }
 
@@ -67,11 +100,20 @@ export async function updateLabel(gmail: any, labelId: string, updates: {
     labelListVisibility?: string;
 }) {
     try {
-        // Verify the label exists before updating
-        await gmail.users.labels.get({
-            userId: 'me',
-            id: labelId,
-        });
+        // deleteLabel already refuses system labels using exactly this lookup;
+        // updateLabel did the same get and then didn't check, so renaming SENT
+        // came back as Gmail's "Invalid label name: SENT" — which reads like
+        // the name was malformed rather than the label being untouchable.
+        const current = await gmail.users.labels.get({ userId: 'me', id: labelId });
+        if (current.data?.type === 'system') {
+            throw new Error(`"${current.data.name}" is a Gmail system label and cannot be renamed or reconfigured.`);
+        }
+        if (Object.keys(updates).length === 0) {
+            throw new Error(
+                `No changes given for label "${current.data?.name ?? labelId}" — ` +
+                `pass name, messageListVisibility or labelListVisibility.`,
+            );
+        }
 
         const response = await gmail.users.labels.update({
             userId: 'me',
@@ -85,7 +127,7 @@ export async function updateLabel(gmail: any, labelId: string, updates: {
             throw new Error(`Label with ID "${labelId}" not found.`);
         }
         
-        throw new Error(`Failed to update label: ${error.message}`);
+        throw describeLabelError('update label', error);
     }
 }
 
@@ -118,7 +160,7 @@ export async function deleteLabel(gmail: any, labelId: string) {
             throw new Error(`Label with ID "${labelId}" not found.`);
         }
         
-        throw new Error(`Failed to delete label: ${error.message}`);
+        throw describeLabelError('delete label', error);
     }
 }
 
@@ -150,7 +192,7 @@ export async function listLabels(gmail: any) {
             }
         };
     } catch (error: any) {
-        throw new Error(`Failed to list labels: ${error.message}`);
+        throw describeLabelError('list labels', error);
     }
 }
 
@@ -172,7 +214,7 @@ export async function findLabelByName(gmail: any, labelName: string) {
         
         return foundLabel || null;
     } catch (error: any) {
-        throw new Error(`Failed to find label: ${error.message}`);
+        throw describeLabelError('find label', error);
     }
 }
 
@@ -190,14 +232,29 @@ export async function getOrCreateLabel(gmail: any, labelName: string, options: {
     try {
         // First try to find an existing label
         const existingLabel = await findLabelByName(gmail, labelName);
-        
+
         if (existingLabel) {
-            return existingLabel;
+            // The caller exposes messageListVisibility / labelListVisibility on
+            // this tool but they only ever applied on the create path, so a hit
+            // reported success while silently ignoring them. Say so instead.
+            const drift = (['messageListVisibility', 'labelListVisibility'] as const)
+                .filter(key => options[key] && options[key] !== (existingLabel as any)[key]);
+            if (drift.length > 0) {
+                throw new Error(
+                    `Label "${existingLabel.name}" already exists with different ${drift.join(' and ')}. ` +
+                    `Use update_label (id ${existingLabel.id}) to change it.`,
+                );
+            }
+            // Whether the label was created is a fact this function knows and
+            // the caller was reduced to guessing from the label's shape — and
+            // guessing it backwards.
+            return { ...existingLabel, created: false };
         }
-        
+
         // If not found, create a new one
-        return await createLabel(gmail, labelName, options);
+        const created = await createLabel(gmail, labelName, options);
+        return { ...created, created: true };
     } catch (error: any) {
-        throw new Error(`Failed to get or create label: ${error.message}`);
+        throw describeLabelError('get or create label', error);
     }
 }

@@ -221,3 +221,108 @@ describe('.eml byte fidelity', () => {
         expect(source).not.toMatch(/rawResponse\.data\.raw[^\n]*toString\("utf-8"\)/);
     });
 });
+
+describe('benign input must not destroy data or the flow', () => {
+    it('recovers the good addresses when one entry is malformed', async () => {
+        const { parseEmailAddresses } = await import('./email-export.js');
+        // parseAddressList is all-or-nothing: it returns null for the WHOLE
+        // header, so one bad entry used to discard every good one and the
+        // export silently claimed the message had no recipients. The three
+        // commonest malformed forms in real mail all hit it.
+        expect(parseEmailAddresses('Smith, John <john@example.com>, jane@example.com'))
+            .toEqual([
+                { name: 'John', email: 'john@example.com' },
+                { name: '', email: 'jane@example.com' },
+            ]);
+        expect(parseEmailAddresses('a@x.com; b@y.com').map(a => a.email))
+            .toEqual(['a@x.com', 'b@y.com']);
+        expect(parseEmailAddresses('a@x.com, b@y.com,').map(a => a.email))
+            .toEqual(['a@x.com', 'b@y.com']);
+    });
+
+    it('does not invent a recipient out of display-name debris', async () => {
+        const { parseEmailAddresses } = await import('./email-export.js');
+        for (const address of parseEmailAddresses('Smith, John <john@example.com>')) {
+            expect(address.email).toContain('@');
+        }
+    });
+
+    it('keeps the members of a group-syntax recipient list', async () => {
+        const { parseEmailAddresses } = await import('./email-export.js');
+        expect(parseEmailAddresses('Engineering: alice@example.com, bob@example.com;').map(a => a.email))
+            .toEqual(['alice@example.com', 'bob@example.com']);
+        // An empty group still contributes nothing.
+        expect(parseEmailAddresses('undisclosed-recipients:;')).toEqual([]);
+    });
+
+    it('never exports a date the field cannot represent', async () => {
+        const { gmailMessageToJson } = await import('./email-export.js');
+        const json = (value: string) => gmailMessageToJson(
+            { id: '1', threadId: '1', payload: { headers: [{ name: 'Date', value }] } },
+            { text: '', html: '' },
+            [],
+        );
+
+        // new Date() rolls out-of-range components over, so a 31-February
+        // header was exported as an authoritative 3 March.
+        expect(json('Sun, 31 Feb 2025 10:00:00 +0000').date).toBe('');
+        // An unparseable header used to pass through raw into a field the
+        // format documents as ISO-8601.
+        expect(json('Tue, 32 Jan 2026 99:99:99 +0000').date).toBe('');
+        // Either way the header itself survives.
+        expect(json('Sun, 31 Feb 2025 10:00:00 +0000').headers.Date)
+            .toBe('Sun, 31 Feb 2025 10:00:00 +0000');
+        // A real date still round-trips.
+        expect(json('Wed, 12 Feb 2025 10:00:00 +0000').date).toBe('2025-02-12T10:00:00.000Z');
+    });
+
+    it('addresses a reply to the real sender, not one named in the display name', async () => {
+        const { buildReplyAllRecipients } = await import('./reply-all-helpers.js');
+        // Taking the FIRST bracketed group let a display name decide where a
+        // reply went. Display names are attacker-controlled wherever user text
+        // is relayed.
+        const result = buildReplyAllRecipients(
+            '"Support <support@paypal.com>" <attacker@evil.example>',
+            'me@me.com',
+            '',
+            'me@me.com',
+        );
+        expect(result.to).toEqual(['attacker@evil.example']);
+        expect(result.to).not.toContain('support@paypal.com');
+    });
+
+    it('drops tokens that are not addresses instead of putting them in a header', async () => {
+        const { buildReplyAllRecipients } = await import('./reply-all-helpers.js');
+        const { to, cc } = buildReplyAllRecipients(
+            'Bob <bob@x.com>',
+            'Team (sales@x.com), EMEA <emea@x.com>',
+            '',
+            'me@me.com',
+        );
+        for (const address of [...to, ...cc]) {
+            expect(address).not.toContain(' ');
+            expect(address).not.toContain('(');
+        }
+        expect(cc).toContain('emea@x.com');
+    });
+
+    it('validates cc and bcc, not only to', async () => {
+        const { createEmailMessage } = await import('./utl.js');
+        expect(() => createEmailMessage({ to: ['ok@x.com'], cc: ['Team (sales@x.com)'], subject: 's', body: 'b' }))
+            .toThrow(/invalid in cc/);
+        expect(() => createEmailMessage({ to: ['ok@x.com'], bcc: ['not an address'], subject: 's', body: 'b' }))
+            .toThrow(/invalid in bcc/);
+    });
+
+    it('does not send two copies to an address on both To and Cc', async () => {
+        const { buildReplyAllRecipients } = await import('./reply-all-helpers.js');
+        const { to, cc } = buildReplyAllRecipients(
+            'Bob <bob@x.com>',
+            'carol@x.com',
+            'carol@x.com, bob@x.com',
+            'me@me.com',
+        );
+        const all = [...to, ...cc].map(a => a.toLowerCase());
+        expect(new Set(all).size).toBe(all.length);
+    });
+});

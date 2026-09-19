@@ -56,7 +56,7 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 - Send emails with subject, content, **attachments**, and recipients
 - **Full attachment support** - send and receive file attachments
 - **Download email attachments** to local filesystem
-- **Download full emails** to files in json/eml/txt/html formats (`.eml` is written as a byte-for-byte copy of the original message, so attachments survive intact)
+- **Download full emails** to files in json/eml/txt/html formats (`.eml` is written as a byte-for-byte copy of the original message, so attachments survive intact; `html` falls back to the plain text for text-only mail rather than failing)
 - **Thread-level operations** - get full threads, list inbox threads, batch-expand threads
 - Support for HTML emails and multipart messages with both HTML and plain text versions
 - Full support for international characters in subject lines and email content
@@ -1018,6 +1018,8 @@ The server intelligently extracts email content from complex MIME structures:
 - Prioritizes plain text content when available
 - Falls back to HTML content if plain text is not available
 - Handles multi-part MIME messages with nested parts
+- Recovers the readable recipients when a `To`/`Cc` header is malformed — an unquoted comma in a display name, Outlook's semicolon separators or a trailing comma no longer discard the whole list — and keeps the members of a group-syntax list
+- Exports `date` as ISO-8601 or as an empty string; a header like `31 Feb` is never silently rolled over into a plausible-looking wrong date, and the raw header is always preserved under `headers.Date`
 - Decodes each part with the charset it declares (Big5, Shift_JIS, GBK, ISO-8859-1, …), not UTF-8 unconditionally. The `Content-Type` parameters are parsed properly rather than scanned, so a `charset` hidden inside a quoted parameter value by the sender cannot steer the decoder
 - Bounds MIME nesting at 32 levels, so a hostile or malformed message cannot overflow the call stack
 - **Processes attachments information (filename, type, size, download ID)**
@@ -1113,7 +1115,17 @@ A cc-only or bcc-only send is valid: `to` may be empty as long as `cc` or `bcc` 
    - A custom callback URL must match one of the authorized redirect URIs registered in the Google Cloud Console
    - `auth` reports `EADDRINUSE` and `EACCES` with the port and the fix instead of exiting on an unhandled error. A callback URL with no port defaults to 80, which needs elevated privileges — give it an explicit high port
 
-6. **Authentication ended before you finished signing in**
+6. **Tools are listed but every call fails**
+   - `Not authenticated. No Gmail credentials at ...` means `auth` has not run, or ran as a different user than the server. Run it as the same user, then restart the server
+   - `Gmail credentials are no longer valid` means the refresh token was revoked or expired. Re-run `auth`. OAuth projects left in **"Testing"** publishing status expire refresh tokens after 7 days, so this recurs weekly until the consent screen is published
+   - A corrupt `~/.gmail-mcp/credentials.json` is no longer fatal: it is ignored with a warning and `auth` can repair it
+
+7. **`--scopes` seems to be ignored**
+   - It requires the `=` form: `--scopes=gmail.readonly`. `--scopes gmail.readonly` is rejected rather than silently falling back to the (wider) defaults
+   - An empty `--scopes=` is rejected too, instead of requesting no scopes and timing out on the consent screen
+   - `reply_all` and `forward_email` read the original message before sending, so they need `gmail.modify` (or `gmail.full`); they are hidden on a send-only or compose-only grant rather than listed and then failing with a 403
+
+8. **Authentication ended before you finished signing in**
    - Reloading the callback URL, a browser prefetch, or opening it by hand no longer aborts the run: a hit carrying neither a code nor an error is answered with 400 and the listener keeps waiting
    - Declining the Google consent screen ends the run with `Authentication failed: Authentication was declined on the Google consent screen.` — re-run `auth` and accept
    - The flow times out after 10 minutes if the consent redirect never arrives

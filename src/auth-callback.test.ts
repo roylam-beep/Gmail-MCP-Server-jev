@@ -19,6 +19,20 @@ const ENTRY = path.join(REPO_ROOT, 'dist', 'index.js');
  */
 const built = fs.existsSync(ENTRY);
 
+// Skipping the whole end-to-end suite because dist/ happens to be missing is
+// how a real regression slips through unnoticed — `npm run prebuild` wipes
+// dist/, so a bare `npm test` at the wrong moment silently proves nothing. CI
+// always builds first, so there it is an error, not a skip.
+if (!built && process.env.CI) {
+    throw new Error(
+        `${ENTRY} is missing — run \`npm run build\` before \`npm test\`. ` +
+        'This suite drives the real server and cannot be skipped in CI.',
+    );
+}
+if (!built) {
+    console.warn('[auth-callback] dist/ not built — skipping the end-to-end auth suite.');
+}
+
 let home: string;
 let proc: ChildProcess | undefined;
 let port = 0;

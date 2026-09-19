@@ -27,9 +27,39 @@ describe('resolveToolPrefix', () => {
             expect(resolveToolPrefix(['--scopes=gmail.modify', '--tool-prefix=info_'], NO_ENV)).toBe('info_');
         });
 
-        it('preserves a value that itself contains an equals sign', () => {
-            expect(resolveToolPrefix(['--tool-prefix=a=b_'], NO_ENV)).toBe('a=b_');
+        it('splits on the first equals sign only, then rejects the rest', () => {
+            // The value is still read as "a=b_" rather than truncated at the
+            // second "=", but "=" is not legal in an MCP tool name, so it is
+            // now refused instead of producing tool names every client drops.
+            expect(() => resolveToolPrefix(['--tool-prefix=a=b_'], NO_ENV))
+                .toThrow(/Invalid tool prefix "a=b_"/);
         });
+    });
+
+    describe('character validation', () => {
+        // MCP tool names are ^[a-zA-Z0-9_-]{1,128}$. Nothing checked, so a
+        // prefix like "gmail." or a stray trailing space produced tool names
+        // the client rejected wholesale — the user saw no tools and nothing
+        // named the prefix as the cause.
+        for (const bad of ['work ', 'gmail.', 'my gmail', 'a/b', 'a:b']) {
+            it(`rejects ${JSON.stringify(bad)} and suggests a legal form`, () => {
+                expect(() => resolveToolPrefix([`--tool-prefix=${bad}`], NO_ENV))
+                    .toThrow(/Invalid tool prefix/);
+                expect(() => resolveToolPrefix([`--tool-prefix=${bad}`], NO_ENV))
+                    .toThrow(/Try "/);
+            });
+        }
+
+        it('rejects an invalid prefix from the environment too', () => {
+            expect(() => resolveToolPrefix([], { GMAIL_MCP_TOOL_PREFIX: 'work ' }))
+                .toThrow(/Invalid tool prefix/);
+        });
+
+        for (const good of ['personal_', 'info-', 'work123', '']) {
+            it(`accepts ${JSON.stringify(good)}`, () => {
+                expect(resolveToolPrefix([`--tool-prefix=${good}`], NO_ENV)).toBe(good);
+            });
+        }
     });
 
     describe('--tool-prefix <value> (space-separated) form', () => {

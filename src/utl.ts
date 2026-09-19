@@ -179,12 +179,20 @@ export function createEmailMessage(validatedArgs: any): string {
     // Generate a random boundary string for multipart messages
     const boundary = `----=_NextPart_${Math.random().toString(36).substring(2)}`;
 
-    // Validate email addresses
-    (validatedArgs.to as string[]).forEach(email => {
-        if (!validateEmail(email)) {
-            throw new Error(`Recipient email address is invalid: ${email}`);
+    // Validate every recipient field, not just `to`. cc and bcc went
+    // unchecked, so a malformed value — one built by reply_all from a display
+    // name, say — landed in the header verbatim.
+    for (const [field, values] of [
+        ['to', validatedArgs.to],
+        ['cc', validatedArgs.cc],
+        ['bcc', validatedArgs.bcc],
+    ] as Array<[string, string[] | undefined]>) {
+        for (const email of values || []) {
+            if (!validateEmail(email)) {
+                throw new Error(`Recipient email address is invalid in ${field}: ${email}`);
+            }
         }
-    });
+    }
 
     // Sanitize all user-supplied header values to prevent CRLF injection
     const from = sanitizeHeaderValue(validatedArgs.from || 'me');

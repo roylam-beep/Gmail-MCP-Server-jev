@@ -140,10 +140,25 @@ describe("download_email formats", () => {
       expect(html).toContain("<b>HTML</b>");
     });
 
-    it("throws when no HTML content available", () => {
-      expect(() => emailToHtml({ text: "plain only", html: "" })).toThrow(
-        "This email has no HTML content"
-      );
+    it("falls back to the plain text when there is no HTML", () => {
+      // Throwing here wrote no file at all for the majority of automated
+      // mail — CI notifications, git send-email patches, cron output, bounce
+      // reports. emailToTxt already degrades; this now matches.
+      const html = emailToHtml({ text: "plain only", html: "" });
+      expect(html).toContain("plain only");
+      expect(html).toContain("<pre");
+    });
+
+    it("escapes the plain text it falls back to", () => {
+      const html = emailToHtml({ text: '<script>alert(1)</script> & "q"', html: "" });
+      expect(html).not.toContain("<script>");
+      expect(html).toContain("&lt;script&gt;");
+      expect(html).toContain("&amp;");
+      expect(html).toContain("&quot;");
+    });
+
+    it("still returns something for a message with no content at all", () => {
+      expect(emailToHtml({ text: "", html: "" })).toContain("no text or HTML content");
     });
   });
 });

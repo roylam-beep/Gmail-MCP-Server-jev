@@ -155,12 +155,28 @@ describe('collectForwardAttachments', () => {
         expect(collectForwardAttachments(payload)[0].filename).toBe('logo@example');
     });
 
-    it('falls back to a generic filename when there is neither filename nor cid', () => {
+    it('derives a distinct filename from the attachment id when there is neither filename nor cid', () => {
         const payload = {
             parts: [{ mimeType: 'application/octet-stream', body: { attachmentId: 'att-1', size: 1 } }],
         };
 
-        expect(collectForwardAttachments(payload)[0].filename).toBe('attachment');
+        expect(collectForwardAttachments(payload)[0].filename).toBe('attachment-att-1');
+    });
+
+    it('does not give two filename-less parts the same name', () => {
+        // A literal 'attachment' for every such part meant the recipient of a
+        // forward got files that overwrite each other on save. Happens with
+        // Outlook multipart/related parts referenced by Content-Location and
+        // with S/MIME signature parts.
+        const payload = {
+            parts: [
+                { mimeType: 'image/png', body: { attachmentId: 'A1', size: 1 } },
+                { mimeType: 'image/png', body: { attachmentId: 'A2', size: 1 } },
+            ],
+        };
+
+        const names = collectForwardAttachments(payload).map(a => a.filename);
+        expect(new Set(names).size).toBe(names.length);
     });
 
     it('defaults a missing mimeType to application/octet-stream', () => {
