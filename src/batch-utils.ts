@@ -87,3 +87,37 @@ export async function processBatchesWithFallback<T>(
 
     return { successes, failures };
 }
+
+/**
+ * Map over `items` with at most `limit` operations in flight.
+ *
+ * Read paths used to fan out with a bare Promise.all: search_emails issued one
+ * messages.get per hit (up to 500) and get_inbox_with_threads one threads.get
+ * per thread, all at once. Gmail answers that burst with 429
+ * rateLimitExceeded, so the larger the request the more likely it fails
+ * outright. A bounded window keeps results in input order and the request rate
+ * inside Gmail's per-user quota.
+ */
+export async function mapWithConcurrency<T, U>(
+    items: T[],
+    limit: number,
+    mapper: (item: T, index: number) => Promise<U>,
+): Promise<U[]> {
+    const results = new Array<U>(items.length);
+    const width = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 1;
+    let next = 0;
+
+    const worker = async (): Promise<void> => {
+        while (true) {
+            const index = next++;
+            if (index >= items.length) return;
+            results[index] = await mapper(items[index], index);
+        }
+    };
+
+    await Promise.all(
+        Array.from({ length: Math.min(width, items.length) }, () => worker()),
+    );
+
+    return results;
+}

@@ -77,6 +77,8 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 
 ## Installation & Authentication
 
+**Requires Node.js 22 or newer.** This is the version CI builds and tests against, the version the Docker image is built on, and the floor declared in `package.json`.
+
 ### Installing from npm (recommended)
 
 ```bash
@@ -1016,15 +1018,19 @@ The server intelligently extracts email content from complex MIME structures:
 - Prioritizes plain text content when available
 - Falls back to HTML content if plain text is not available
 - Handles multi-part MIME messages with nested parts
+- Decodes each part with the charset it declares (Big5, Shift_JIS, GBK, ISO-8859-1, …), not UTF-8 unconditionally
+- Bounds MIME nesting at 32 levels, so a hostile or malformed message cannot overflow the call stack
 - **Processes attachments information (filename, type, size, download ID)**
+- Attachment filenames are reduced to a single safe path component before they are reported or written
 - Preserves original email headers (From, To, Subject, Date)
 
 ### International Character Support
 
 The server fully supports non-ASCII characters in email subjects and content, including:
 - Turkish, Chinese, Japanese, Korean, and other non-Latin alphabets
-- Special characters and symbols
-- Proper encoding ensures correct display in email clients
+- Special characters, symbols and emoji
+- Outgoing bodies are sent with a `Content-Transfer-Encoding` that matches the bytes: `7bit` for ASCII, `base64` (wrapped at 76 characters) for anything else. Declaring `7bit` for a UTF-8 body is what produces mojibake in strict clients.
+- Subjects are encoded as RFC 2047 encoded-words of at most 75 characters, folded onto continuation lines, and never split mid-character
 
 ### Comprehensive Label Management
 
@@ -1047,11 +1053,29 @@ These label management features enable sophisticated organization of emails dire
 
 The server includes efficient batch processing capabilities:
 
-- Process up to 50 emails at once (configurable batch size)
+- Process up to 50 emails at once (`batchSize`, 1-100; up to 1000 message IDs per call)
 - Automatic chunking of large email sets to avoid API limits
-- Detailed success/failure reporting for each operation
-- Graceful error handling with individual retries
+- Per-message success/failure reporting: each message settles independently, so one failure never re-issues the calls that already succeeded (this used to report already-deleted messages as failures)
+- `batch_report_phishing` uses Gmail's native `batchModify` and retries a failed chunk one message at a time, which is safe because applying the SPAM label is idempotent
+- Read-heavy tools (`search_emails`, `list_inbox_threads`, `get_inbox_with_threads`) cap Gmail reads at 5 in flight, keeping large result sets inside the per-user quota instead of returning `429 rateLimitExceeded`
 - Perfect for bulk inbox management and organization tasks
+
+### Input validation
+
+Every tool argument is bounded by its schema, so a malformed call is rejected before it reaches the Gmail API:
+
+| Argument | Bound |
+| --- | --- |
+| `batchSize` | integer, 1-100 |
+| `maxResults` | integer, 1-500 |
+| `messageIds` | 1-1000 entries |
+| `to` / `cc` / `bcc` | 1-100 addresses, 320 characters each |
+| `addLabelIds` / `removeLabelIds` | up to 100 entries |
+| `attachments` | up to 25 file paths |
+| `inlineImages` | up to 50 images |
+| `subject` | 998 characters (RFC 5322 line limit) |
+| `query` | 2048 characters |
+| `body` / `htmlBody` | 10 MB |
 
 ## Security Notes
 
@@ -1060,6 +1084,10 @@ The server includes efficient batch processing capabilities:
 - Never share or commit your credentials to version control
 - Regularly review and revoke unused access in your Google Account settings
 - Credentials are stored globally but are only accessible by the current user
+- `credentials.json` and `gcp-oauth.keys.json` are written `0600` and the config directory `0700`. Permissions are re-applied on every start, so a file created before this (or under a permissive umask) is tightened rather than left world-readable
+- Credential writes are atomic (temp file + `fsync` + `rename`), so a crash or a token refresh racing the auth flow cannot leave a truncated `credentials.json` and lose your refresh token
+- Download paths are validated: filenames from attachments and message IDs are reduced to a single safe component and the resolved path is verified to stay inside the requested directory
+- All server diagnostics go to stderr. stdout carries only the MCP JSON-RPC stream
 - **Attachment files are processed locally and never stored permanently by the server**
 
 ## Troubleshooting

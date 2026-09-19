@@ -12,6 +12,15 @@
 export const MAX_FORWARD_ATTACHMENT_TOTAL_BYTES = 25 * 1024 * 1024;
 
 /**
+ * Ceiling on how deep the MIME tree of the message being forwarded is walked.
+ * The traversal is recursion over structure supplied by whoever sent the mail,
+ * so an inbound message with a few thousand nested multipart levels would
+ * overflow the call stack and take the server down with it. Mirrors
+ * MAX_MIME_DEPTH in mime-utils.ts.
+ */
+export const MAX_FORWARD_MIME_DEPTH = 32;
+
+/**
  * A single attachment part discovered on the message being forwarded.
  */
 export interface ForwardAttachmentRef {
@@ -73,8 +82,8 @@ export function normalizeContentId(raw: string): string {
 export function collectForwardAttachments(payload: MessagePartLike | null | undefined): ForwardAttachmentRef[] {
     const found: ForwardAttachmentRef[] = [];
 
-    const walk = (part: MessagePartLike | null | undefined): void => {
-        if (!part) return;
+    const walk = (part: MessagePartLike | null | undefined, depth: number): void => {
+        if (!part || depth > MAX_FORWARD_MIME_DEPTH) return;
 
         const attachmentId = part.body?.attachmentId;
         if (attachmentId) {
@@ -95,11 +104,11 @@ export function collectForwardAttachments(payload: MessagePartLike | null | unde
         }
 
         for (const child of part.parts || []) {
-            walk(child);
+            walk(child, depth + 1);
         }
     };
 
-    walk(payload);
+    walk(payload, 0);
     return found;
 }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { processItemsIndividually, processBatchesWithFallback } from './batch-utils.js';
+import { processItemsIndividually, processBatchesWithFallback, mapWithConcurrency } from './batch-utils.js';
 
 describe('processItemsIndividually', () => {
     it('reports every item as a success when all succeed', async () => {
@@ -123,5 +123,64 @@ describe('processBatchesWithFallback', () => {
     it('terminates on a degenerate batch size', async () => {
         const { successes } = await processBatchesWithFallback(['a', 'b'], 0, async () => {});
         expect(successes).toEqual(['a', 'b']);
+    });
+});
+
+describe('mapWithConcurrency', () => {
+    it('preserves input order', async () => {
+        const result = await mapWithConcurrency([5, 1, 3], 2, async (n) => {
+            await new Promise(resolve => setTimeout(resolve, n));
+            return n * 2;
+        });
+        expect(result).toEqual([10, 2, 6]);
+    });
+
+    it('never exceeds the concurrency limit', async () => {
+        // H10: search_emails and the thread listings used a bare Promise.all,
+        // so a 500-result page issued 500 simultaneous Gmail reads and came
+        // back 429 rateLimitExceeded.
+        let inFlight = 0;
+        let peak = 0;
+
+        await mapWithConcurrency(Array.from({ length: 50 }, (_, i) => i), 5, async (n) => {
+            inFlight += 1;
+            peak = Math.max(peak, inFlight);
+            await new Promise(resolve => setTimeout(resolve, 1));
+            inFlight -= 1;
+            return n;
+        });
+
+        expect(peak).toBeLessThanOrEqual(5);
+        expect(peak).toBeGreaterThan(1);
+    });
+
+    it('still runs concurrently rather than serially', async () => {
+        const started: number[] = [];
+        await mapWithConcurrency([0, 1, 2, 3], 4, async (n) => {
+            started.push(n);
+            await new Promise(resolve => setTimeout(resolve, 5));
+            return n;
+        });
+        // All four workers pick up an item before any of them finishes.
+        expect(started).toEqual([0, 1, 2, 3]);
+    });
+
+    it('handles an empty list without hanging', async () => {
+        expect(await mapWithConcurrency([], 5, async (n) => n)).toEqual([]);
+    });
+
+    it('propagates the first rejection', async () => {
+        await expect(
+            mapWithConcurrency([1, 2, 3], 2, async (n) => {
+                if (n === 2) throw new Error('boom');
+                return n;
+            }),
+        ).rejects.toThrow('boom');
+    });
+
+    it('terminates on a degenerate limit', async () => {
+        for (const limit of [0, -3, NaN]) {
+            expect(await mapWithConcurrency([1, 2], limit, async (n) => n)).toEqual([1, 2]);
+        }
     });
 });

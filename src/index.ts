@@ -24,7 +24,8 @@ import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailS
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 import { resolveToolPrefix } from "./tool-prefix.js";
 import { sanitizeFilename, fallbackAttachmentName, resolveWithinDirectory } from "./filename-utils.js";
-import { processItemsIndividually, processBatchesWithFallback } from "./batch-utils.js";
+import { processItemsIndividually, processBatchesWithFallback, mapWithConcurrency } from "./batch-utils.js";
+import { extractEmailContent, extractAttachments, findAttachmentFilename, GmailMessagePart } from "./mime-utils.js";
 import { ensureSecureDirFor, hardenFilePermissions, writeSecretJsonAtomic } from "./secure-store.js";
 
 // stdout is reserved for the MCP JSON-RPC stream (StdioServerTransport).
@@ -47,66 +48,10 @@ const CREDENTIALS_PATH = process.env.GMAIL_CREDENTIALS_PATH || path.join(CONFIG_
 // and exits before the server starts — run `auth` without --tool-prefix.
 const TOOL_PREFIX = resolveToolPrefix(process.argv.slice(2), process.env);
 
-// Type definitions for Gmail API responses
-interface GmailMessagePart {
-    partId?: string;
-    mimeType?: string;
-    filename?: string;
-    headers?: Array<{
-        name: string;
-        value: string;
-    }>;
-    body?: {
-        attachmentId?: string;
-        size?: number;
-        data?: string;
-    };
-    parts?: GmailMessagePart[];
-}
-
-interface EmailContent {
-    text: string;
-    html: string;
-}
-
 // OAuth2 configuration
 let oauth2Client: OAuth2Client;
 let authorizedScopes: string[] = DEFAULT_SCOPES;
 let callbackUrl: URL;
-
-/**
- * Recursively extract email body content from MIME message parts
- * Handles complex email structures with nested parts
- */
-function extractEmailContent(messagePart: GmailMessagePart): EmailContent {
-    // Initialize containers for different content types
-    let textContent = '';
-    let htmlContent = '';
-
-    // If the part has a body with data, process it based on MIME type
-    if (messagePart.body && messagePart.body.data) {
-        const content = Buffer.from(messagePart.body.data, 'base64').toString('utf8');
-
-        // Store content based on its MIME type
-        if (messagePart.mimeType === 'text/plain') {
-            textContent = content;
-        } else if (messagePart.mimeType === 'text/html') {
-            htmlContent = content;
-        }
-    }
-
-    // If the part has nested parts, recursively process them
-    if (messagePart.parts && messagePart.parts.length > 0) {
-        for (const part of messagePart.parts) {
-            const { text, html } = extractEmailContent(part);
-            if (text) textContent += text;
-            if (html) htmlContent += html;
-        }
-    }
-
-    // Return both plain text and HTML content
-    return { text: textContent, html: htmlContent };
-}
 
 /**
  * Extract common headers from Gmail message payload
@@ -124,32 +69,6 @@ function extractHeaders(payload: any): { subject: string; from: string; to: stri
         date: getHeader("date"),
         rfcMessageId: getHeader("message-id"),
     };
-}
-
-/**
- * Extract attachments from Gmail message payload
- */
-function extractAttachments(payload: GmailMessagePart): EmailAttachment[] {
-    const attachments: EmailAttachment[] = [];
-
-    function processAttachmentParts(part: GmailMessagePart) {
-        if (part.body && part.body.attachmentId) {
-            attachments.push({
-                id: part.body.attachmentId,
-                filename: part.filename
-                    ? sanitizeFilename(part.filename)
-                    : fallbackAttachmentName(part.body.attachmentId),
-                mimeType: part.mimeType || "application/octet-stream",
-                size: part.body.size || 0,
-            });
-        }
-        if (part.parts) {
-            part.parts.forEach((subpart: GmailMessagePart) => processAttachmentParts(subpart));
-        }
-    }
-
-    processAttachmentParts(payload);
-    return attachments;
 }
 
 async function loadCredentials() {
@@ -354,6 +273,11 @@ async function main() {
         console.error('Authentication completed successfully');
         process.exit(0);
     }
+
+    // Gmail's per-user quota is 250 units/second and messages.get costs 5, so
+    // an unbounded Promise.all over a 500-result page is answered with 429
+    // rateLimitExceeded. Cap how many reads are in flight at once.
+    const GMAIL_READ_CONCURRENCY = 5;
 
     // Initialize Gmail API
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
@@ -662,8 +586,10 @@ async function main() {
                     });
 
                     const messages = response.data.messages || [];
-                    const results = await Promise.all(
-                        messages.map(async (msg) => {
+                    const results = await mapWithConcurrency(
+                        messages,
+                        GMAIL_READ_CONCURRENCY,
+                        async (msg) => {
                             const detail = await gmail.users.messages.get({
                                 userId: 'me',
                                 id: msg.id!,
@@ -677,7 +603,7 @@ async function main() {
                                 from: headers.find(h => h.name === 'From')?.value || '',
                                 date: headers.find(h => h.name === 'Date')?.value || '',
                             };
-                        })
+                        },
                     );
 
                     return {
@@ -1330,21 +1256,10 @@ async function main() {
                                 format: 'full',
                             });
 
-                            // Find the attachment part to get original filename
-                            const findAttachment = (part: any): string | null => {
-                                if (part.body && part.body.attachmentId === validatedArgs.attachmentId) {
-                                    return part.filename || fallbackAttachmentName(validatedArgs.attachmentId);
-                                }
-                                if (part.parts) {
-                                    for (const subpart of part.parts) {
-                                        const found = findAttachment(subpart);
-                                        if (found) return found;
-                                    }
-                                }
-                                return null;
-                            };
-
-                            filename = findAttachment(messageResponse.data.payload) || fallbackAttachmentName(validatedArgs.attachmentId);
+                            filename = findAttachmentFilename(
+                                messageResponse.data.payload as GmailMessagePart,
+                                validatedArgs.attachmentId,
+                            ) || fallbackAttachmentName(validatedArgs.attachmentId);
                         }
 
                         // Sanitize filename to prevent path traversal
@@ -1407,24 +1322,9 @@ async function main() {
                         }
 
                         // Extract attachment metadata
-                        const attachments: EmailAttachment[] = [];
-                        const processAttachmentParts = (part: GmailMessagePart) => {
-                            if (part.body && part.body.attachmentId) {
-                                const filename = part.filename || `attachment-${part.body.attachmentId}`;
-                                attachments.push({
-                                    id: part.body.attachmentId,
-                                    filename: filename,
-                                    mimeType: part.mimeType || 'application/octet-stream',
-                                    size: part.body.size || 0,
-                                });
-                            }
-                            if (part.parts) {
-                                part.parts.forEach((subpart: GmailMessagePart) => processAttachmentParts(subpart));
-                            }
-                        };
-                        if (msg.payload) {
-                            processAttachmentParts(msg.payload as GmailMessagePart);
-                        }
+                        const attachments: EmailAttachment[] = msg.payload
+                            ? extractAttachments(msg.payload as GmailMessagePart)
+                            : [];
 
                         return {
                             messageId: msg.id || '',
@@ -1474,8 +1374,10 @@ async function main() {
                     const threads = threadIds.map(id => ({ id, snippet: '', historyId: '' }));
 
                     // Fetch metadata for each thread to get message count and latest message info
-                    const threadDetails = await Promise.all(
-                        threads.map(async (thread) => {
+                    const threadDetails = await mapWithConcurrency(
+                        threads,
+                        GMAIL_READ_CONCURRENCY,
+                        async (thread) => {
                             const detail = await gmail.users.threads.get({
                                 userId: 'me',
                                 id: thread.id!,
@@ -1498,7 +1400,7 @@ async function main() {
                                     date: latestHeaders.find(h => h.name === 'Date')?.value || '',
                                 },
                             };
-                        })
+                        },
                     );
 
                     return {
@@ -1527,8 +1429,10 @@ async function main() {
 
                     if (!validatedArgs.expandThreads) {
                         // Return basic thread list without expansion (same as list_inbox_threads)
-                        const threadSummaries = await Promise.all(
-                            threads.map(async (thread) => {
+                        const threadSummaries = await mapWithConcurrency(
+                            threads,
+                            GMAIL_READ_CONCURRENCY,
+                            async (thread) => {
                                 const detail = await gmail.users.threads.get({
                                     userId: 'me',
                                     id: thread.id!,
@@ -1551,7 +1455,7 @@ async function main() {
                                         date: latestHeaders.find(h => h.name === 'Date')?.value || '',
                                     },
                                 };
-                            })
+                            },
                         );
 
                         return {
@@ -1568,8 +1472,10 @@ async function main() {
                     }
 
                     // Expand each thread with full message content (parallel fetch)
-                    const expandedThreads = await Promise.all(
-                        threads.map(async (thread) => {
+                    const expandedThreads = await mapWithConcurrency(
+                        threads,
+                        GMAIL_READ_CONCURRENCY,
+                        async (thread) => {
                             const threadDetail = await gmail.users.threads.get({
                                 userId: 'me',
                                 id: thread.id!,
@@ -1591,26 +1497,9 @@ async function main() {
                                 const body = text || html || '';
 
                                 // Extract attachment metadata
-                                const attachments: EmailAttachment[] = [];
-                                const processAttachmentParts = (part: GmailMessagePart) => {
-                                    if (part.body && part.body.attachmentId) {
-                                        const filename = part.filename
-                                            ? sanitizeFilename(part.filename)
-                                            : fallbackAttachmentName(part.body.attachmentId!);
-                                        attachments.push({
-                                            id: part.body.attachmentId,
-                                            filename: filename,
-                                            mimeType: part.mimeType || 'application/octet-stream',
-                                            size: part.body.size || 0,
-                                        });
-                                    }
-                                    if (part.parts) {
-                                        part.parts.forEach((subpart: GmailMessagePart) => processAttachmentParts(subpart));
-                                    }
-                                };
-                                if (msg.payload) {
-                                    processAttachmentParts(msg.payload as GmailMessagePart);
-                                }
+                                const attachments: EmailAttachment[] = msg.payload
+                                    ? extractAttachments(msg.payload as GmailMessagePart)
+                                    : [];
 
                                 return {
                                     messageId: msg.id || '',
@@ -1636,7 +1525,7 @@ async function main() {
                                 messageCount: messages.length,
                                 messages,
                             };
-                        })
+                        },
                     );
 
                     return {
