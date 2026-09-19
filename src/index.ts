@@ -24,6 +24,11 @@ import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailS
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 import { resolveToolPrefix } from "./tool-prefix.js";
 
+// stdout is reserved for the MCP JSON-RPC stream (StdioServerTransport).
+// Anything written there that is not a protocol frame corrupts the session for
+// the client, so every diagnostic in this file goes to stderr — console.log is
+// deliberately unused.
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Configuration paths
@@ -175,7 +180,7 @@ async function loadCredentials() {
         if (fs.existsSync(localOAuthPath)) {
             // If found in current directory, copy to config directory
             fs.copyFileSync(localOAuthPath, OAUTH_PATH);
-            console.log('OAuth keys found in current directory, copied to global config.');
+            console.error('OAuth keys found in current directory, copied to global config.');
         }
 
         if (!fs.existsSync(OAUTH_PATH)) {
@@ -205,7 +210,7 @@ async function loadCredentials() {
         // where TLS terminates at the proxy and traffic is forwarded to the local
         // listener on port 3000. Direct browser->listener https would hang.
         if (callbackUrl.protocol === 'https:') {
-            console.log('https callback URL detected: assuming a reverse proxy terminates TLS and forwards to the local listener on port 3000 (see README "Cloud Server Authentication").');
+            console.error('https callback URL detected: assuming a reverse proxy terminates TLS and forwards to the local listener on port 3000 (see README "Cloud Server Authentication").');
         }
 
         oauth2Client = new OAuth2Client(
@@ -280,8 +285,8 @@ async function authenticate(scopes: string[]) {
             scope: scopeUrls,
         });
 
-        console.log('Requesting scopes:', scopes.join(', '));
-        console.log('Please visit this URL to authenticate:', authUrl);
+        console.error('Requesting scopes:', scopes.join(', '));
+        console.error('Please visit this URL to authenticate:', authUrl);
         open(authUrl);
 
         server.on('request', async (req, res) => {
@@ -307,7 +312,7 @@ async function authenticate(scopes: string[]) {
 
                 res.writeHead(200);
                 res.end('Authentication successful! You can close this window.');
-                console.log('Credentials saved with scopes:', scopes.join(', '));
+                console.error('Credentials saved with scopes:', scopes.join(', '));
                 server.close();
                 resolve();
             } catch (error) {
@@ -342,13 +347,13 @@ async function main() {
                 process.exit(1);
             }
         } else {
-            console.log('No --scopes flag specified, using defaults:', DEFAULT_SCOPES.join(', '));
-            console.log('Tip: Use --scopes=gmail.readonly for read-only access');
-            console.log('Available scopes:', getAvailableScopeNames().join(', '));
+            console.error('No --scopes flag specified, using defaults:', DEFAULT_SCOPES.join(', '));
+            console.error('Tip: Use --scopes=gmail.readonly for read-only access');
+            console.error('Available scopes:', getAvailableScopeNames().join(', '));
         }
 
         await authenticate(scopes);
-        console.log('Authentication completed successfully');
+        console.error('Authentication completed successfully');
         process.exit(0);
     }
 
