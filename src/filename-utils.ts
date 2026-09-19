@@ -63,7 +63,13 @@ export function sanitizeFilename(filename: string): string {
     name = name.trim();
 
     if (!name) return 'unnamed';
-    if (WINDOWS_RESERVED_NAMES.test(name)) return `_${name}`;
+    // Prefix rather than return: the reserved-name pattern accepts an extension
+    // of any length, so returning here would skip the byte cap below and a
+    // name like `CON.` + 500 characters would still hit ENAMETOOLONG. The
+    // prefix also costs a byte, which the cap has to account for.
+    if (WINDOWS_RESERVED_NAMES.test(name)) {
+        name = `_${name}`;
+    }
 
     if (Buffer.byteLength(name) <= MAX_FILENAME_BYTES) return name;
 

@@ -45,6 +45,22 @@ describe('sanitizeFilename', () => {
         expect(sanitizeFilename('line\nbreak.txt')).toBe('line_break.txt');
     });
 
+    it('truncates a reserved device name with an over-long extension', () => {
+        // The reserved-name pattern accepts an extension of any length, so the
+        // escape must not short-circuit the byte cap.
+        const result = sanitizeFilename('CON.' + 'y'.repeat(500));
+        expect(Buffer.byteLength(result)).toBeLessThanOrEqual(MAX_FILENAME_BYTES);
+        expect(result.startsWith('_CON')).toBe(true);
+    });
+
+    it('keeps a reserved name at the byte cap within budget once prefixed', () => {
+        // The '_' prefix costs a byte, so a name sitting exactly on the cap
+        // must still come back within it.
+        const result = sanitizeFilename('nul.' + 'y'.repeat(MAX_FILENAME_BYTES - 4));
+        expect(Buffer.byteLength(result)).toBeLessThanOrEqual(MAX_FILENAME_BYTES);
+        expect(result.startsWith('_nul')).toBe(true);
+    });
+
     it('escapes Windows reserved device names', () => {
         expect(sanitizeFilename('CON')).toBe('_CON');
         expect(sanitizeFilename('nul.txt')).toBe('_nul.txt');
