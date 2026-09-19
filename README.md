@@ -1117,14 +1117,6 @@ Open your PR against `experimental` when possible. If you target `main`, a maint
 To bypass for commits that genuinely don't need a docs update (dependency bumps, CI config changes), include `[skip-readme]` or `[no-readme]` in your commit message or PR title.
 
 
-## Running evals
-
-The evals package loads an mcp client that then runs the index.ts file, so there is no need to rebuild between tests. You can load environment variables by prefixing the npx command. Full documentation can be found [here](https://www.mcpevals.io/docs).
-
-```bash
-OPENAI_API_KEY=your-key  npx mcp-eval src/evals/evals.ts src/index.ts
-```
-
 ## License
 
 MIT
