@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "gmail-mcp",
   "display_name": "Gmail MCP Server",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "description": "Lean Gmail MCP server with auto authentication support (maintained fork of GongRzhe/Gmail-MCP-Server)",
   "long_description": "A Model Context Protocol server for Gmail: search, read, send, draft, label, filter, thread and attachment operations, with automatic Google OAuth authentication. Runs locally over stdio. Requires a Google Cloud OAuth client (gcp-oauth.keys.json); run the bundled server once with the `auth` argument (or place keys at ~/.gmail-mcp/gcp-oauth.keys.json) to complete authentication.",
   "author": {
