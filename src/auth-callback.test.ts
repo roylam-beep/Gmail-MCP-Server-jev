@@ -18,30 +18,60 @@ const ENTRY = path.join(REPO_ROOT, 'dist', 'index.js');
  * and a stale build would test the wrong thing.
  */
 const built = fs.existsSync(ENTRY);
-const port = 38900 + (process.pid % 60);
 
 let home: string;
 let proc: ChildProcess | undefined;
+let port = 0;
 let stderr = '';
 let stdout = '';
+
+/**
+ * Every test gets its own port. Reusing one across tests failed
+ * intermittently: afterEach's SIGKILL returns before the kernel has released
+ * the socket, so the next spawn hit EADDRINUSE, exited, and the fetch that
+ * followed got ECONNREFUSED. Reproduced roughly 1 run in 5 before this.
+ */
+function nextPort(): number {
+    // Spread by pid so parallel vitest workers and concurrent CI runs on the
+    // same machine do not collide.
+    return 38000 + ((process.pid * 97) % 20000) + portOffset++;
+}
+let portOffset = 0;
 
 async function get(pathname: string): Promise<{ status: number; body: string }> {
     const res = await fetch(`http://127.0.0.1:${port}${pathname}`);
     return { status: res.status, body: await res.text() };
 }
 
-const waitFor = (predicate: () => boolean, ms = 8000) => new Promise<void>((resolve, reject) => {
-    const started = Date.now();
-    const tick = () => {
-        if (predicate()) return resolve();
-        if (Date.now() - started > ms) return reject(new Error('timed out waiting for the listener'));
-        setTimeout(tick, 50);
-    };
-    tick();
-});
+const waitFor = (predicate: () => boolean | Promise<boolean>, ms = 10000) =>
+    new Promise<void>((resolve, reject) => {
+        const started = Date.now();
+        const tick = async () => {
+            try {
+                if (await predicate()) return resolve();
+            } catch { /* keep polling */ }
+            if (Date.now() - started > ms) return reject(new Error('timed out waiting for the listener'));
+            setTimeout(tick, 50);
+        };
+        void tick();
+    });
+
+/**
+ * Readiness is the port actually accepting a connection, not a line on stderr.
+ * The URL is printed before `server.listen` can report EADDRINUSE, so a
+ * stderr match would pass for a process that is already on its way out.
+ */
+async function listening(): Promise<boolean> {
+    if (proc?.exitCode !== null && proc?.exitCode !== undefined) {
+        throw new Error(`auth exited early (code ${proc.exitCode}):\n${stderr}`);
+    }
+    const res = await fetch(`http://127.0.0.1:${port}/__ping`).catch(() => undefined);
+    return res !== undefined;
+}
 
 beforeEach(async () => {
     if (!built) return;
+    port = nextPort();
     home = fs.mkdtempSync(path.join(os.tmpdir(), 'gmail-mcp-auth-'));
     fs.mkdirSync(path.join(home, '.gmail-mcp'), { recursive: true });
     fs.writeFileSync(
@@ -65,7 +95,9 @@ beforeEach(async () => {
     proc.stdout!.on('data', d => { stdout += d; });
     proc.stderr!.on('data', d => { stderr += d; });
 
-    await waitFor(() => stderr.includes('Please visit this URL'));
+    await waitFor(listening);
+    // The ping above is itself a non-callback request, so drop what it logged.
+    stdout = '';
 });
 
 afterEach(() => {
