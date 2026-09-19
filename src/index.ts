@@ -190,12 +190,43 @@ async function authenticate(scopes: string[]) {
     const port = callbackUrl.port
         ? Number(callbackUrl.port)
         : (callbackUrl.protocol === 'https:' ? 3000 : 80);
-    server.listen(port, '127.0.0.1');
 
     // Convert shorthand scope names (e.g., "gmail.readonly") to full Google API URLs
     const scopeUrls = scopeNamesToUrls(scopes);
 
     return new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (error?: Error) => {
+            if (settled) return;
+            settled = true;
+            server.close();
+            if (error) reject(error); else resolve();
+        };
+
+        // Without a listener for 'error', a failed bind is an unhandled event
+        // that terminates the process with a raw stack trace. Port 80 (the
+        // default for a portless http:// callback) needs root, and a second
+        // `auth` run while the first is still waiting hits EADDRINUSE — both
+        // are ordinary situations that deserve an actionable message.
+        server.on('error', (err: NodeJS.ErrnoException) => {
+            if (err.code === 'EADDRINUSE') {
+                finish(new Error(
+                    `Port ${port} is already in use. Close the other authentication attempt, ` +
+                    `or point the callback URL at a free port.`,
+                ));
+            } else if (err.code === 'EACCES') {
+                finish(new Error(
+                    `Permission denied binding port ${port}. Ports below 1024 need elevated ` +
+                    `privileges — use a callback URL with an explicit high port, e.g. ` +
+                    `http://localhost:3000/oauth2callback.`,
+                ));
+            } else {
+                finish(err);
+            }
+        });
+
+        server.listen(port, '127.0.0.1');
+
         const authUrl = oauth2Client.generateAuthUrl({
             access_type: 'offline',
             prompt: 'consent',
@@ -215,7 +246,7 @@ async function authenticate(scopes: string[]) {
             if (!code) {
                 res.writeHead(400);
                 res.end('No code provided');
-                reject(new Error('No code provided'));
+                finish(new Error('No code provided'));
                 return;
             }
 
@@ -230,12 +261,13 @@ async function authenticate(scopes: string[]) {
                 res.writeHead(200);
                 res.end('Authentication successful! You can close this window.');
                 console.error('Credentials saved with scopes:', scopes.join(', '));
-                server.close();
-                resolve();
+                finish();
             } catch (error) {
                 res.writeHead(500);
                 res.end('Authentication failed');
-                reject(error);
+                // The listener used to stay open on this path, so a failed
+                // token exchange left the process hanging with no way out.
+                finish(error instanceof Error ? error : new Error(String(error)));
             }
         });
     });
@@ -294,8 +326,14 @@ async function main() {
         const threadIds: string[] = [];
         const seen = new Set<string>();
         let pageToken: string | undefined;
+        // A query whose hits are concentrated in a few long threads yields
+        // almost no new thread IDs per page, so the loop would walk the whole
+        // mailbox looking for maxResults distinct threads. Cap the walk.
+        const MAX_PAGES = 20;
+        let pages = 0;
 
-        while (threadIds.length < maxResults) {
+        while (threadIds.length < maxResults && pages < MAX_PAGES) {
+            pages += 1;
             const response = await gmailClient.users.messages.list({
                 userId: 'me',
                 q: query,
@@ -638,7 +676,14 @@ async function main() {
                         const { subject, from, date } = extractHeaders(fullResponse.data.payload);
                         const attachments = extractAttachments(fullResponse.data.payload as GmailMessagePart);
 
-                        let content: string;
+                        // A .eml is a byte-for-byte copy of the original
+                        // RFC822 message, so it stays a Buffer. Decoding it to a
+                        // UTF-8 string and re-encoding replaced every byte that
+                        // is not valid UTF-8 — 8-bit attachment payloads,
+                        // Latin-1 headers — with U+FFFD, producing a corrupt
+                        // .eml whose attachments no longer open. Text formats
+                        // are genuine strings and keep the utf-8 write.
+                        let content: string | Buffer;
 
                         if (format === "eml") {
                             // For EML format, fetch raw RFC822 message
@@ -647,7 +692,7 @@ async function main() {
                                 id: messageId,
                                 format: "raw",
                             });
-                            content = Buffer.from(rawResponse.data.raw || "", "base64url").toString("utf-8");
+                            content = Buffer.from(rawResponse.data.raw || "", "base64url");
                         } else {
                             // Extract email content for json/txt/html
                             const emailContent = extractEmailContent(fullResponse.data.payload as GmailMessagePart || {});
@@ -669,7 +714,11 @@ async function main() {
                         // inside savePath.
                         const filename = sanitizeFilename(`${messageId}.${format}`);
                         const fullPath = resolveWithinDirectory(savePath, filename);
-                        fs.writeFileSync(fullPath, content, "utf-8");
+                        if (Buffer.isBuffer(content)) {
+                            fs.writeFileSync(fullPath, content);
+                        } else {
+                            fs.writeFileSync(fullPath, content, "utf-8");
+                        }
                         const stats = fs.statSync(fullPath);
 
                         // Return metadata with attachments

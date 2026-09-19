@@ -56,7 +56,7 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 - Send emails with subject, content, **attachments**, and recipients
 - **Full attachment support** - send and receive file attachments
 - **Download email attachments** to local filesystem
-- **Download full emails** to files in json/eml/txt/html formats
+- **Download full emails** to files in json/eml/txt/html formats (`.eml` is written as a byte-for-byte copy of the original message, so attachments survive intact)
 - **Thread-level operations** - get full threads, list inbox threads, batch-expand threads
 - Support for HTML emails and multipart messages with both HTML and plain text versions
 - Full support for international characters in subject lines and email content
@@ -1104,9 +1104,11 @@ Every tool argument is bounded by its schema, so a malformed call is rejected be
    - By default authentication uses port 3000; either free it up before running authentication, or run on a different port by passing a custom callback URL (e.g. `node dist/index.js auth http://localhost:8080/oauth2callback`)
    - If freeing port 3000, you can find and stop the process using that port
    - A custom callback URL must match one of the authorized redirect URIs registered in the Google Cloud Console
+   - `auth` reports `EADDRINUSE` and `EACCES` with the port and the fix instead of exiting on an unhandled error. A callback URL with no port defaults to 80, which needs elevated privileges — give it an explicit high port
 
 4. **Batch Operation Failures**
-   - If batch operations fail, they automatically retry individual items
+   - Per-message endpoints (`batch_modify_emails`, `batch_delete_emails`) settle each message independently; a failure is reported for that message only and its siblings are never re-issued
+   - `batch_report_phishing` uses Gmail's batch endpoint and retries a failed chunk one message at a time
    - Check the detailed error messages for specific failures
    - Consider reducing the batch size if you encounter rate limiting
 
