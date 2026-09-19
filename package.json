@@ -53,24 +53,36 @@
   "engines": {
     "node": ">=14.0.0"
   },
+  "overrides": {
+    "@actions/http-client": "^3.0.2",
+    "@hono/node-server": "^1.19.17",
+    "body-parser": "^2.3.0",
+    "fast-uri": "^3.1.8",
+    "hono": "^4.13.8",
+    "ip-address": "^10.7.2",
+    "js-yaml": "^4.3.2",
+    "jsondiffpatch": "^0.7.6",
+    "qs": "^6.16.0",
+    "undici": "^6.28.1"
+  },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "email-addresses": "^5.0.0",
-    "google-auth-library": "^9.4.1",
-    "googleapis": "^129.0.0",
+    "google-auth-library": "^11.1.0",
+    "googleapis": "^181.0.0",
     "mime-types": "^3.0.1",
-    "nodemailer": "^7.0.11",
+    "nodemailer": "^10.0.10",
     "open": "^10.0.0",
     "zod": "^3.22.4",
     "zod-to-json-schema": "^3.22.1"
   },
   "devDependencies": {
     "@types/mime-types": "^2.1.4",
-    "@types/node": "^20.10.5",
+    "@types/node": "^24.13.6",
     "@types/nodemailer": "^6.4.17",
     "lockfile-lint": "^5.0.0",
     "mcp-evals": "^1.0.18",
     "typescript": "^5.3.3",
-    "vitest": "^4.0.18"
+    "vitest": "^5.0.1"
   }
 }
