@@ -23,6 +23,9 @@ import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope
 import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ForwardEmailSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 import { resolveToolPrefix } from "./tool-prefix.js";
+import { sanitizeFilename, fallbackAttachmentName, resolveWithinDirectory } from "./filename-utils.js";
+import { processItemsIndividually, processBatchesWithFallback } from "./batch-utils.js";
+import { ensureSecureDirFor, hardenFilePermissions, writeSecretJsonAtomic } from "./secure-store.js";
 
 // stdout is reserved for the MCP JSON-RPC stream (StdioServerTransport).
 // Anything written there that is not a protocol frame corrupts the session for
@@ -123,25 +126,6 @@ function extractHeaders(payload: any): { subject: string; from: string; to: stri
     };
 }
 
-// Most filesystems cap filenames at 255 bytes. Gmail attachment IDs for larger
-// attachments can be ~500 chars, so a fallback name like `attachment-<id>`
-// would exceed that and fail with ENAMETOOLONG on write.
-const MAX_FILENAME_LENGTH = 200;
-
-function sanitizeFilename(filename: string): string {
-    let name = path.basename(filename);
-    if (Buffer.byteLength(name) <= MAX_FILENAME_LENGTH) {
-        return name;
-    }
-    const ext = path.extname(name);
-    const stem = name.slice(0, MAX_FILENAME_LENGTH - Buffer.byteLength(ext));
-    return stem + ext;
-}
-
-function fallbackAttachmentName(attachmentId: string): string {
-    return sanitizeFilename(`attachment-${attachmentId.slice(0, 16)}`);
-}
-
 /**
  * Extract attachments from Gmail message payload
  */
@@ -152,7 +136,9 @@ function extractAttachments(payload: GmailMessagePart): EmailAttachment[] {
         if (part.body && part.body.attachmentId) {
             attachments.push({
                 id: part.body.attachmentId,
-                filename: part.filename || `attachment-${part.body.attachmentId}`,
+                filename: part.filename
+                    ? sanitizeFilename(part.filename)
+                    : fallbackAttachmentName(part.body.attachmentId),
                 mimeType: part.mimeType || "application/octet-stream",
                 size: part.body.size || 0,
             });
@@ -168,10 +154,12 @@ function extractAttachments(payload: GmailMessagePart): EmailAttachment[] {
 
 async function loadCredentials() {
     try {
-        // Create config directory if it doesn't exist
-        if (!process.env.GMAIL_OAUTH_PATH && !process.env.GMAIL_CREDENTIALS_PATH && !fs.existsSync(CONFIG_DIR)) {
-            fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
-        }
+        // Create the directory holding each configured path. Deriving it from the
+        // paths actually in use covers the case where only one of
+        // GMAIL_OAUTH_PATH / GMAIL_CREDENTIALS_PATH is overridden — the other
+        // still points into ~/.gmail-mcp, which nobody would otherwise create.
+        ensureSecureDirFor(OAUTH_PATH);
+        ensureSecureDirFor(CREDENTIALS_PATH);
 
         // Check for OAuth keys in current directory first, then in config directory
         const localOAuthPath = path.join(process.cwd(), 'gcp-oauth.keys.json');
@@ -180,6 +168,9 @@ async function loadCredentials() {
         if (fs.existsSync(localOAuthPath)) {
             // If found in current directory, copy to config directory
             fs.copyFileSync(localOAuthPath, OAUTH_PATH);
+            // copyFileSync carries the source file's mode over, which is
+            // whatever the user's umask produced — commonly world-readable.
+            hardenFilePermissions(OAUTH_PATH);
             console.error('OAuth keys found in current directory, copied to global config.');
         }
 
@@ -220,6 +211,13 @@ async function loadCredentials() {
         );
 
         if (fs.existsSync(CREDENTIALS_PATH)) {
+            // Credentials written before this check (or with a permissive umask)
+            // stay world-readable, and writeFileSync's `mode` never revisits an
+            // existing file. Tighten on every start.
+            if (hardenFilePermissions(CREDENTIALS_PATH)) {
+                console.error(`Tightened permissions on ${CREDENTIALS_PATH} to 0600.`);
+            }
+
             const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
 
             // Credentials file structure (v1.2.0+):
@@ -250,7 +248,7 @@ async function loadCredentials() {
                     const updated = onDisk.tokens
                         ? { ...onDisk, tokens: mergedTokens }
                         : mergedTokens;
-                    fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(updated, null, 2), { mode: 0o600 });
+                    writeSecretJsonAtomic(CREDENTIALS_PATH, updated);
                 } catch (err) {
                     console.error('Failed to persist refreshed tokens:', err);
                 }
@@ -308,7 +306,7 @@ async function authenticate(scopes: string[]) {
 
                 // Store both tokens and authorized scopes for runtime filtering
                 const credentials = { tokens, scopes };
-                fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(credentials, null, 2), { mode: 0o600 });
+                writeSecretJsonAtomic(CREDENTIALS_PATH, credentials);
 
                 res.writeHead(200);
                 res.end('Authentication successful! You can close this window.');
@@ -612,36 +610,6 @@ async function main() {
             }
         }
 
-        // Helper function to process operations in batches
-        async function processBatches<T, U>(
-            items: T[],
-            batchSize: number,
-            processFn: (batch: T[]) => Promise<U[]>
-        ): Promise<{ successes: U[], failures: { item: T, error: Error }[] }> {
-            const successes: U[] = [];
-            const failures: { item: T, error: Error }[] = [];
-            
-            // Process in batches
-            for (let i = 0; i < items.length; i += batchSize) {
-                const batch = items.slice(i, i + batchSize);
-                try {
-                    const results = await processFn(batch);
-                    successes.push(...results);
-                } catch (error) {
-                    // If batch fails, try individual items
-                    for (const item of batch) {
-                        try {
-                            const result = await processFn([item]);
-                            successes.push(...result);
-                        } catch (itemError) {
-                            failures.push({ item, error: itemError as Error });
-                        }
-                    }
-                }
-            }
-            
-            return { successes, failures };
-        }
 
         try {
             switch (name) {
@@ -769,9 +737,12 @@ async function main() {
                             }
                         }
 
-                        // Write file
-                        const filename = `${messageId}.${format}`;
-                        const fullPath = path.join(savePath, filename);
+                        // Write file. messageId is caller-supplied, so it is
+                        // reduced to a single safe path component before it
+                        // becomes a filename, and the join is verified to stay
+                        // inside savePath.
+                        const filename = sanitizeFilename(`${messageId}.${format}`);
+                        const fullPath = resolveWithinDirectory(savePath, filename);
                         fs.writeFileSync(fullPath, content, "utf-8");
                         const stats = fs.statSync(fullPath);
 
@@ -962,23 +933,17 @@ async function main() {
                         requestBody.removeLabelIds = validatedArgs.removeLabelIds;
                     }
 
-                    // Process messages in batches
-                    const { successes, failures } = await processBatches(
+                    // messages.modify is a per-message endpoint, so each message
+                    // settles on its own: one failure no longer replays its
+                    // siblings (which re-issued calls that had already succeeded).
+                    const { successes, failures } = await processItemsIndividually(
                         messageIds,
                         batchSize,
-                        async (batch) => {
-                            const results = await Promise.all(
-                                batch.map(async (messageId) => {
-                                    const result = await gmail.users.messages.modify({
-                                        userId: 'me',
-                                        id: messageId,
-                                        requestBody: requestBody,
-                                    });
-                                    return { messageId, success: true };
-                                })
-                            );
-                            return results;
-                        }
+                        (messageId) => gmail.users.messages.modify({
+                            userId: 'me',
+                            id: messageId,
+                            requestBody: requestBody,
+                        }),
                     );
 
                     // Generate summary of the operation
@@ -1030,20 +995,20 @@ async function main() {
                     const messageIds = validatedArgs.messageIds;
                     const batchSize = validatedArgs.batchSize || 50;
 
-                    const { successes, failures } = await processBatches(
+                    // batchModify is a true batch endpoint: a rejection says
+                    // nothing about individual messages, so a failed chunk is
+                    // retried one message at a time. Adding the SPAM label is
+                    // idempotent, so the retry is safe.
+                    const { successes, failures } = await processBatchesWithFallback(
                         messageIds,
                         batchSize,
-                        async (batch) => {
-                            await gmail.users.messages.batchModify({
-                                userId: 'me',
-                                requestBody: {
-                                    ids: batch,
-                                    addLabelIds: ['SPAM'],
-                                },
-                            });
-
-                            return batch.map((messageId) => ({ messageId, success: true }));
-                        }
+                        (batch) => gmail.users.messages.batchModify({
+                            userId: 'me',
+                            requestBody: {
+                                ids: batch,
+                                addLabelIds: ['SPAM'],
+                            },
+                        }),
                     );
 
                     const successCount = successes.length;
@@ -1075,22 +1040,17 @@ async function main() {
                     const messageIds = validatedArgs.messageIds;
                     const batchSize = validatedArgs.batchSize || 50;
 
-                    // Process messages in batches
-                    const { successes, failures } = await processBatches(
+                    // Deletion is permanent and NOT idempotent: the old
+                    // whole-batch retry re-deleted messages that had already
+                    // succeeded, got a 404, and reported them as failures.
+                    // Each message settles on its own instead.
+                    const { successes, failures } = await processItemsIndividually(
                         messageIds,
                         batchSize,
-                        async (batch) => {
-                            const results = await Promise.all(
-                                batch.map(async (messageId) => {
-                                    await gmail.users.messages.delete({
-                                        userId: 'me',
-                                        id: messageId,
-                                    });
-                                    return { messageId, success: true };
-                                })
-                            );
-                            return results;
-                        }
+                        (messageId) => gmail.users.messages.delete({
+                            userId: 'me',
+                            id: messageId,
+                        }),
                     );
 
                     // Generate summary of the operation
@@ -1395,12 +1355,8 @@ async function main() {
                             fs.mkdirSync(savePath, { recursive: true });
                         }
 
-                        // Resolve and validate final path stays within savePath
-                        const resolvedSavePath = path.resolve(savePath);
-                        const fullPath = path.resolve(resolvedSavePath, filename);
-                        if (!fullPath.startsWith(resolvedSavePath + path.sep) && fullPath !== resolvedSavePath) {
-                            throw new Error('Invalid filename: path traversal detected');
-                        }
+                        // Resolve and validate the final path stays within savePath
+                        const fullPath = resolveWithinDirectory(savePath, filename);
                         fs.writeFileSync(fullPath, buffer);
 
                         return {
@@ -1638,7 +1594,9 @@ async function main() {
                                 const attachments: EmailAttachment[] = [];
                                 const processAttachmentParts = (part: GmailMessagePart) => {
                                     if (part.body && part.body.attachmentId) {
-                                        const filename = part.filename || `attachment-${part.body.attachmentId}`;
+                                        const filename = part.filename
+                                            ? sanitizeFilename(part.filename)
+                                            : fallbackAttachmentName(part.body.attachmentId!);
                                         attachments.push({
                                             id: part.body.attachmentId,
                                             filename: filename,
