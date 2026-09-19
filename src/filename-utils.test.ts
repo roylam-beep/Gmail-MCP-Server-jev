@@ -77,6 +77,39 @@ describe('sanitizeFilename', () => {
         expect(sanitizeFilename('.bashrc')).toBe('bashrc');
     });
 
+    it('is not fooled by Unicode whitespace around the dots', () => {
+        // The edge strips used to run before trim(), and trim() removes the
+        // whole Unicode whitespace set while the strips only covered ASCII
+        // space — so one NBSP put the leading dot back. An attachment named
+        // " .bashrc" by the SENDER then wrote a dotfile into savePath.
+        expect(sanitizeFilename(' .bashrc')).toBe('bashrc');
+        expect(sanitizeFilename('\u00A0.bashrc')).toBe('bashrc');
+        expect(sanitizeFilename('\uFEFF.profile\uFEFF')).toBe('profile');
+        expect(sanitizeFilename('evil.txt.\u00A0')).toBe('evil.txt');
+        for (const input of ['\u00A0..\u00A0', '\uFEFF..\uFEFF', '\u00A0.\u00A0', '\u2028.\u2029']) {
+            const result = sanitizeFilename(input);
+            expect(result).not.toBe('..');
+            expect(result).not.toBe('.');
+            expect(result).toBe('unnamed');
+        }
+    });
+
+    it('does not re-introduce a trailing dot or space when truncating', () => {
+        // The byte-cap fallthrough runs long after the edge strip, so whatever
+        // byte 200 lands on used to survive. Windows treats "x." and "x" as the
+        // same file, so a trailing dot silently changes the name.
+        const dotAtBoundary = sanitizeFilename('a'.repeat(199) + '.' + 'b'.repeat(200));
+        expect(dotAtBoundary.endsWith('.')).toBe(false);
+
+        const spaceAtBoundary = sanitizeFilename('a'.repeat(198) + '. ' + 'b'.repeat(300));
+        expect(/[\s.]$/.test(spaceAtBoundary)).toBe(false);
+
+        for (const name of [dotAtBoundary, spaceAtBoundary]) {
+            expect(Buffer.byteLength(name)).toBeLessThanOrEqual(MAX_FILENAME_BYTES);
+            expect(name.length).toBeGreaterThan(0);
+        }
+    });
+
     it('truncates to the byte budget and keeps the extension', () => {
         const long = 'a'.repeat(500) + '.pdf';
         const result = sanitizeFilename(long);
@@ -125,6 +158,22 @@ describe('fallbackAttachmentName', () => {
 describe('resolveWithinDirectory', () => {
     it('resolves a plain filename inside the directory', () => {
         expect(resolveWithinDirectory('/tmp/out', 'a.pdf')).toBe(path.resolve('/tmp/out/a.pdf'));
+    });
+
+    it('works when the directory is a filesystem root', () => {
+        // A `startsWith(dir + sep)` check made the prefix '//' for '/', so every
+        // filename was rejected with a misleading traversal error.
+        expect(resolveWithinDirectory('/', 'a.txt')).toBe(path.resolve('/a.txt'));
+    });
+
+    it('rejects a filename that resolves to the directory itself', () => {
+        // Writing there hits EISDIR; there is no valid case for it.
+        expect(() => resolveWithinDirectory('/tmp/out', '.')).toThrow(/path traversal/);
+        expect(() => resolveWithinDirectory('/tmp/out', '')).toThrow(/path traversal/);
+    });
+
+    it('tolerates a trailing separator on the directory', () => {
+        expect(resolveWithinDirectory('/tmp/out/', 'a.pdf')).toBe(path.resolve('/tmp/out/a.pdf'));
     });
 
     it('rejects an escape attempt', () => {

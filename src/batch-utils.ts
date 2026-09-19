@@ -36,7 +36,12 @@ export async function processItemsIndividually<T>(
 
     for (let i = 0; i < items.length; i += step) {
         const batch = items.slice(i, i + step);
-        const settled = await Promise.allSettled(batch.map(item => processItem(item)));
+        // Calling processItem inside the wrapper keeps a SYNCHRONOUS throw from
+        // escaping before allSettled runs, which would reject the whole call
+        // and discard every success already recorded.
+        const settled = await Promise.allSettled(
+            batch.map(async item => processItem(item)),
+        );
 
         settled.forEach((result, index) => {
             if (result.status === 'fulfilled') {
@@ -106,12 +111,23 @@ export async function mapWithConcurrency<T, U>(
     const results = new Array<U>(items.length);
     const width = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 1;
     let next = 0;
+    // Promise.all rejects on the first failure but never signals the other
+    // workers, so they used to drain the whole list in the background after the
+    // handler had already returned the error. On a 429 that meant the remaining
+    // ~495 requests of a 500-hit page still went out — the opposite of what
+    // bounding the fan-out is for.
+    let failed = false;
 
     const worker = async (): Promise<void> => {
-        while (true) {
+        while (!failed) {
             const index = next++;
             if (index >= items.length) return;
-            results[index] = await mapper(items[index], index);
+            try {
+                results[index] = await mapper(items[index], index);
+            } catch (error) {
+                failed = true;
+                throw error;
+            }
         }
     };
 

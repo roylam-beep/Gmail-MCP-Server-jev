@@ -24,27 +24,42 @@ describe('Node version alignment', () => {
         expect(manifest.compatibility.runtimes.node).toBe(`>=${EXPECTED_MAJOR}.0.0`);
     });
 
-    it('Dockerfile builds on the same major', () => {
-        const match = read('Dockerfile').match(/^FROM node:(\d+)/m);
-        expect(match).not.toBeNull();
-        expect(Number(match![1])).toBe(EXPECTED_MAJOR);
+    it('every Dockerfile stage builds on the same major', () => {
+        // Without /g only the first FROM was checked, so a second build stage
+        // on a different major would slip through.
+        const stages = [...read('Dockerfile').matchAll(/^FROM node:(\d+)/gm)];
+        expect(stages.length).toBeGreaterThan(0);
+        for (const stage of stages) {
+            expect(Number(stage[1])).toBe(EXPECTED_MAJOR);
+        }
     });
 
     it('every workflow sets up the same major', () => {
+        // A literal-only regex silently ignores `node-version: ${{ matrix.x }}`,
+        // a `[18, 20]` list and `node-version-file:` — so migrating a workflow
+        // to a matrix escaped the check entirely while the assertion still
+        // passed on some other file's surviving literal. Every declaration is
+        // collected, and a non-literal one fails rather than being skipped.
         const workflowDir = path.join(REPO_ROOT, '.github', 'workflows');
         const workflows = fs.readdirSync(workflowDir).filter(f => /\.ya?ml$/.test(f));
-        const versions: Array<{ file: string; version: number }> = [];
+        const declarations: Array<{ file: string; raw: string }> = [];
 
         for (const file of workflows) {
             const contents = fs.readFileSync(path.join(workflowDir, file), 'utf8');
-            for (const match of contents.matchAll(/node-version:\s*'?"?(\d+)/g)) {
-                versions.push({ file, version: Number(match[1]) });
+            for (const match of contents.matchAll(/node-version(-file)?:[ \t]*(.*)/g)) {
+                declarations.push({ file, raw: `${match[1] ? 'node-version-file' : 'node-version'}: ${match[2].trim()}` });
             }
         }
 
-        expect(versions.length).toBeGreaterThan(0);
-        for (const { file, version } of versions) {
-            expect(version, `${file} sets up Node ${version}`).toBe(EXPECTED_MAJOR);
+        expect(declarations.length).toBeGreaterThan(0);
+        for (const { file, raw } of declarations) {
+            const literal = /^node-version:[ \t]*['"]?(\d+)['"]?$/.exec(raw);
+            expect(
+                literal,
+                `${file} declares "${raw}" — only a bare major literal is checkable here, ` +
+                `so update this test if the workflow moves to a matrix or a version file`,
+            ).not.toBeNull();
+            expect(Number(literal![1]), `${file} sets up Node ${literal![1]}`).toBe(EXPECTED_MAJOR);
         }
     });
 });

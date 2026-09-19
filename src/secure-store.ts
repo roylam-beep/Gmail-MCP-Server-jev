@@ -20,7 +20,19 @@ export function ensureSecureDirFor(filePath: string): void {
     const dir = path.dirname(path.resolve(filePath));
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true, mode: SECRET_DIR_MODE });
+        return;
     }
+
+    // An existing directory keeps whatever mode it was created with, so a
+    // ~/.gmail-mcp left at 0755 by an older build or a restored backup stays
+    // group- and world-traversable and the 0600 files inside it are still
+    // enumerable. Same upgrade-path reasoning as hardenFilePermissions, and
+    // best-effort for the same reason.
+    try {
+        if ((fs.statSync(dir).mode & 0o777) !== SECRET_DIR_MODE) {
+            fs.chmodSync(dir, SECRET_DIR_MODE);
+        }
+    } catch { /* filesystems without POSIX permissions */ }
 }
 
 /**
@@ -58,7 +70,13 @@ export function hardenFilePermissions(filePath: string): boolean {
  *
  * Writing to a temp file in the same directory, fsync'ing it, then rename()ing
  * over the target makes the replacement atomic: a reader sees either the old
- * complete file or the new one, never a partial write.
+ * complete file or the new one, never a partial write. The directory is
+ * fsync'd afterwards so the rename itself is durable, not just the contents.
+ *
+ * Note this replaces a symlink at `filePath` with a regular file rather than
+ * writing through it. That is deliberate — writing through a link is how a
+ * credential file ends up somewhere the caller did not choose — but it does
+ * mean a deliberately symlinked credentials.json is detached on first write.
  */
 export function writeSecretFileAtomic(filePath: string, contents: string): void {
     const resolved = path.resolve(filePath);
@@ -94,6 +112,18 @@ export function writeSecretFileAtomic(filePath: string, contents: string): void 
         try { fs.unlinkSync(tempPath); } catch { /* best effort */ }
         throw error;
     }
+
+    // Flush the directory entry. Without this the rename can still be lost on
+    // a crash, so the file would be atomic but not durable. Best-effort:
+    // opening a directory for fsync is not portable.
+    try {
+        const dirFd = fs.openSync(dir, 'r');
+        try {
+            fs.fsyncSync(dirFd);
+        } finally {
+            fs.closeSync(dirFd);
+        }
+    } catch { /* not supported on this platform */ }
 }
 
 /**

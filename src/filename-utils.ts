@@ -15,6 +15,21 @@ const ILLEGAL_FILENAME_CHARS = /[<>:"/\\|?*\u0000-\u001f]/g;
 const WINDOWS_RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
 
 /**
+ * Strip dots and whitespace from both edges.
+ *
+ * The strips and the trim used to be separate steps — `/[. ]+$/`, `/^\.+/`,
+ * then `trim()`. `trim()` removes the whole Unicode whitespace set while the
+ * character classes only covered ASCII space, so a single NBSP defeated both:
+ * `'\u00A0..\u00A0'` came back as `'..'` and `' .bashrc'` as `'.bashrc'` —
+ * a hidden dotfile named by whoever sent the email. One class covering dots
+ * and every Unicode space closes that, and needs no second pass because it
+ * leaves nothing at either edge for one to find.
+ */
+function stripEdges(value: string): string {
+    return value.replace(/^[\s.]+/, '').replace(/[\s.]+$/, '');
+}
+
+/**
  * Truncate to at most `maxBytes` UTF-8 bytes without splitting a multi-byte
  * character. Slicing a Buffer mid-sequence would leave a lone continuation byte
  * and produce a U+FFFD in the name.
@@ -56,11 +71,9 @@ export function sanitizeFilename(filename: string): string {
     name = name.replace(ILLEGAL_FILENAME_CHARS, '_');
 
     // Windows drops trailing dots and spaces, which would let "evil.txt. "
-    // resolve to a different file than the one reported back to the caller.
-    name = name.replace(/[. ]+$/, '');
-    // A leading dot would hide the file; a leading run of dots is traversal.
-    name = name.replace(/^\.+/, '');
-    name = name.trim();
+    // resolve to a different file than the one reported back to the caller; a
+    // leading dot hides the file and a leading run of dots is traversal.
+    name = stripEdges(name);
 
     if (!name) return 'unnamed';
     // Prefix rather than return: the reserved-name pattern accepts an extension
@@ -77,12 +90,14 @@ export function sanitizeFilename(filename: string): string {
     // absurdly long "extension" is just part of an overlong name.
     const ext = path.extname(name);
     const extBytes = Buffer.byteLength(ext);
+    // Truncation can land on a dot or a space, re-introducing exactly what the
+    // strip above removed — so strip again on the way out of every branch.
     if (extBytes > 0 && extBytes < MAX_FILENAME_BYTES / 2) {
         const stem = name.slice(0, name.length - ext.length);
         const truncatedStem = truncateToBytes(stem, MAX_FILENAME_BYTES - extBytes);
-        return (truncatedStem || 'unnamed') + ext;
+        return (stripEdges(truncatedStem) || 'unnamed') + ext;
     }
-    return truncateToBytes(name, MAX_FILENAME_BYTES);
+    return stripEdges(truncateToBytes(name, MAX_FILENAME_BYTES)) || 'unnamed';
 }
 
 /**
@@ -104,7 +119,19 @@ export function fallbackAttachmentName(attachmentId: string): string {
 export function resolveWithinDirectory(directory: string, filename: string): string {
     const resolvedDir = path.resolve(directory);
     const fullPath = path.resolve(resolvedDir, filename);
-    if (fullPath !== resolvedDir && !fullPath.startsWith(resolvedDir + path.sep)) {
+    const relative = path.relative(resolvedDir, fullPath);
+
+    // A prefix comparison against `resolvedDir + path.sep` rejects every
+    // filename when `directory` is a filesystem root: path.resolve('/') is '/',
+    // so the prefix becomes '//' and '/a.txt' does not start with it. It also
+    // has to carve out an exemption for a path equal to the directory itself,
+    // which is never a valid destination for a file write — writing there hits
+    // EISDIR. path.relative() answers both cleanly: empty means the path IS
+    // the directory, '..' means it escaped, absolute means a different root.
+    const escapes = relative === '..'
+        || relative.startsWith(`..${path.sep}`)
+        || path.isAbsolute(relative);
+    if (!relative || escapes) {
         throw new Error('Invalid filename: path traversal detected');
     }
     return fullPath;

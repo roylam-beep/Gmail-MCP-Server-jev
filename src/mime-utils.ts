@@ -41,12 +41,59 @@ export function getPartHeader(part: GmailMessagePart, name: string): string | un
 /**
  * Pull the charset parameter out of a Content-Type header.
  * `text/plain; charset="Big5"` -> `big5`
+ *
+ * Walks the parameters instead of regex-scanning for the first `charset=`.
+ * A scan cannot see quoted-string values, so a sender could hide a decoy in
+ * one: `text/plain; name="a; charset=utf-16le; b"; charset=utf-8` matched the
+ * decoy and decoded a UTF-8 body as UTF-16LE. The `Content-Type` of an inbound
+ * part is chosen by whoever sent the mail, so that was remotely triggerable
+ * mojibake in read_email, get_thread and the file download_email writes.
  */
 export function parseCharset(contentType: string | undefined): string | undefined {
     if (!contentType) return undefined;
-    const match = /;\s*charset\s*=\s*("([^"]*)"|'([^']*)'|([^;\s]+))/i.exec(contentType);
-    const raw = match?.[2] ?? match?.[3] ?? match?.[4];
-    return raw ? raw.trim().toLowerCase() : undefined;
+
+    let charset: string | undefined;
+    let i = contentType.indexOf(';');
+    if (i === -1) return undefined;
+
+    while (i < contentType.length) {
+        i += 1; // step past the ';'
+        while (i < contentType.length && /\s/.test(contentType[i])) i += 1;
+
+        const attributeStart = i;
+        while (i < contentType.length && contentType[i] !== '=' && contentType[i] !== ';') i += 1;
+        const attribute = contentType.slice(attributeStart, i).trim().toLowerCase();
+
+        if (contentType[i] === '=') {
+            i += 1;
+            while (i < contentType.length && /\s/.test(contentType[i])) i += 1;
+
+            let value: string;
+            const quote = contentType[i];
+            if (quote === '"' || quote === "'") {
+                i += 1;
+                let quoted = '';
+                while (i < contentType.length && contentType[i] !== quote) {
+                    if (contentType[i] === '\\' && i + 1 < contentType.length) i += 1;
+                    quoted += contentType[i];
+                    i += 1;
+                }
+                i += 1; // step past the closing quote
+                value = quoted;
+            } else {
+                const valueStart = i;
+                while (i < contentType.length && contentType[i] !== ';') i += 1;
+                value = contentType.slice(valueStart, i).trim();
+            }
+
+            if (attribute === 'charset' && value) charset = value.toLowerCase();
+        }
+
+        // Skip anything left before the next parameter separator.
+        while (i < contentType.length && contentType[i] !== ';') i += 1;
+    }
+
+    return charset;
 }
 
 /**

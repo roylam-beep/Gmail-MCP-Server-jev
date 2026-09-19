@@ -82,7 +82,6 @@ async function loadCredentials() {
 
         // Check for OAuth keys in current directory first, then in config directory
         const localOAuthPath = path.join(process.cwd(), 'gcp-oauth.keys.json');
-        let oauthPath = OAUTH_PATH;
 
         if (fs.existsSync(localOAuthPath)) {
             // If found in current directory, copy to config directory
@@ -91,6 +90,13 @@ async function loadCredentials() {
             // whatever the user's umask produced — commonly world-readable.
             hardenFilePermissions(OAUTH_PATH);
             console.error('OAuth keys found in current directory, copied to global config.');
+        }
+
+        // The keys file holds client_id + client_secret. It is hardened after a
+        // copy above, but the documented placement is to drop it straight into
+        // the config directory — in which case nothing had ever tightened it.
+        if (fs.existsSync(OAUTH_PATH)) {
+            hardenFilePermissions(OAUTH_PATH);
         }
 
         if (!fs.existsSync(OAUTH_PATH)) {
@@ -179,6 +185,9 @@ async function loadCredentials() {
     }
 }
 
+/** How long `auth` waits for the browser to come back before giving up. */
+const AUTH_TIMEOUT_MS = 10 * 60 * 1000;
+
 async function authenticate(scopes: string[]) {
     const server = http.createServer();
     // Port derivation:
@@ -196,9 +205,11 @@ async function authenticate(scopes: string[]) {
 
     return new Promise<void>((resolve, reject) => {
         let settled = false;
+        let timeout: NodeJS.Timeout | undefined;
         const finish = (error?: Error) => {
             if (settled) return;
             settled = true;
+            if (timeout) clearTimeout(timeout);
             server.close();
             if (error) reject(error); else resolve();
         };
@@ -227,6 +238,16 @@ async function authenticate(scopes: string[]) {
 
         server.listen(port, '127.0.0.1');
 
+        // Nothing else ever settles this promise if the user closes the tab or
+        // never visits the URL, so `auth` would wait forever.
+        timeout = setTimeout(() => {
+            finish(new Error(
+                `Timed out after ${AUTH_TIMEOUT_MS / 60000} minutes waiting for the OAuth ` +
+                `callback. Re-run \`auth\` and complete the consent screen in the browser.`,
+            ));
+        }, AUTH_TIMEOUT_MS);
+        timeout.unref();
+
         const authUrl = oauth2Client.generateAuthUrl({
             access_type: 'offline',
             prompt: 'consent',
@@ -235,10 +256,37 @@ async function authenticate(scopes: string[]) {
 
         console.error('Requesting scopes:', scopes.join(', '));
         console.error('Please visit this URL to authenticate:', authUrl);
-        open(authUrl);
+        // `open` rejects on a headless host with no xdg-open and on unsupported
+        // platforms. Unhandled, that rejection terminates the process under
+        // Node's default --unhandled-rejections=throw, taking the listener with
+        // it — the exact crash class the 'error' handler above exists to stop.
+        // The URL is already on stderr, so failing to launch a browser is
+        // recoverable by hand.
+        Promise.resolve(open(authUrl)).catch((err) => {
+            console.error(
+                'Could not open a browser automatically — open the URL above manually.',
+                err instanceof Error ? err.message : err,
+            );
+        });
 
         server.on('request', async (req, res) => {
-            if (!req.url?.startsWith(callbackUrl.pathname)) return;
+            // The authorization code is single-use. Two concurrent hits on the
+            // callback both reach getToken(); the loser gets invalid_grant and,
+            // if its rejection lands first, auth reports failure even though the
+            // winner saved valid credentials.
+            if (settled) {
+                res.writeHead(409);
+                res.end('This authentication attempt has already been handled.');
+                return;
+            }
+
+            if (!req.url?.startsWith(callbackUrl.pathname)) {
+                // Answer rather than drop it: the browser's favicon request on
+                // the success page would otherwise hang until socket timeout.
+                res.writeHead(404);
+                res.end('Not found');
+                return;
+            }
 
             const url = new URL(req.url, callbackUrl.origin);
             const code = url.searchParams.get('code');
@@ -322,7 +370,7 @@ async function main() {
         gmailClient: typeof gmail,
         query: string,
         maxResults: number,
-    ): Promise<string[]> {
+    ): Promise<{ threadIds: string[]; truncated: boolean }> {
         const threadIds: string[] = [];
         const seen = new Set<string>();
         let pageToken: string | undefined;
@@ -354,7 +402,11 @@ async function main() {
             if (!pageToken) break;
         }
 
-        return threadIds;
+        // Hitting the page cap with results still pending looks identical to
+        // reaching the end of the mailbox unless it is reported, and the caller
+        // has no cursor to ask for the rest.
+        const truncated = threadIds.length < maxResults && pages >= MAX_PAGES && Boolean(pageToken);
+        return { threadIds, truncated };
     }
 
     // Server implementation
@@ -1414,7 +1466,7 @@ async function main() {
                     // query silently drops threads that contain messages sent by the
                     // user (e.g. any thread you replied to), so we search messages
                     // instead and group them by thread.
-                    const threadIds = await resolveThreadIdsFromQuery(
+                    const { threadIds, truncated } = await resolveThreadIdsFromQuery(
                         gmail,
                         validatedArgs.query || 'in:inbox',
                         validatedArgs.maxResults || 50,
@@ -1458,6 +1510,7 @@ async function main() {
                                 type: "text",
                                 text: JSON.stringify({
                                     resultCount: threadDetails.length,
+                                    truncated,
                                     threads: threadDetails,
                                 }, null, 2),
                             },
@@ -1468,7 +1521,7 @@ async function main() {
                 case "get_inbox_with_threads": {
                     const validatedArgs = GetInboxWithThreadsSchema.parse(args);
                     // Same threads.list quirk as list_inbox_threads: resolve via messages.list.
-                    const threadIds = await resolveThreadIdsFromQuery(
+                    const { threadIds, truncated } = await resolveThreadIdsFromQuery(
                         gmail,
                         validatedArgs.query || 'in:inbox',
                         validatedArgs.maxResults || 50,
@@ -1513,6 +1566,7 @@ async function main() {
                                     type: "text",
                                     text: JSON.stringify({
                                         resultCount: threadSummaries.length,
+                                        truncated,
                                         threads: threadSummaries,
                                     }, null, 2),
                                 },
@@ -1583,6 +1637,7 @@ async function main() {
                                 type: "text",
                                 text: JSON.stringify({
                                     resultCount: expandedThreads.length,
+                                    truncated,
                                     threads: expandedThreads,
                                 }, null, 2),
                             },

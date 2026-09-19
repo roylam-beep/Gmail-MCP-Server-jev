@@ -17,11 +17,16 @@ const MAX_LINE_LENGTH = 998;
 const BASE64_LINE_LENGTH = 76;
 
 /**
- * RFC 2047 caps a single encoded-word at 75 characters including the
- * `=?UTF-8?B?` and `?=` delimiters, leaving 63 characters of base64 payload,
- * which is 47 bytes of input (base64 expands 3 bytes to 4 characters).
+ * RFC 2047 caps a header LINE containing encoded-words at 76 characters — not
+ * just the encoded-word itself. Sizing the payload from the longest header
+ * name this builder emits keeps the first line inside that limit whichever
+ * header the value lands in.
+ *
+ * Budget: 76 - len('In-Reply-To: ') = 63 characters for the word. Minus the
+ * '=?UTF-8?B?' + '?=' delimiters (12) leaves 51 for base64, rounded down to a
+ * multiple of 4 -> 48 characters -> 36 bytes of input. First line: 13 + 60 = 73.
  */
-const ENCODED_WORD_PAYLOAD_BYTES = 45; // multiple of 3, so no padding mid-word
+const ENCODED_WORD_PAYLOAD_BYTES = 36;
 
 function isAscii(text: string): boolean {
     return !/[^\x00-\x7F]/.test(text);
@@ -53,21 +58,70 @@ function chunkByBytes(text: string, maxBytes: number): string[] {
 }
 
 /**
- * Encode a header value containing non-ASCII characters per RFC 2047.
+ * Emit `Name: value`, folded so no line exceeds the RFC 5322 998-character
+ * limit.
+ *
+ * The limit is on the whole LINE, header name included — a 998-character
+ * subject produces a 1007-character `Subject:` line, and a 100-recipient `To:`
+ * runs to several thousand. Folding is only legal at existing whitespace, so a
+ * single token longer than the budget is emitted as-is; there is nowhere to
+ * break it.
+ */
+function foldHeaderField(name: string, value: string): string {
+    const prefix = `${name}:`;
+    if (prefix.length + 1 + value.length <= MAX_LINE_LENGTH) {
+        return `${prefix} ${value}`;
+    }
+
+    const lines: string[] = [];
+    let current = prefix;
+    for (const token of value.split(' ')) {
+        if (current !== prefix && current.length + 1 + token.length > MAX_LINE_LENGTH) {
+            lines.push(current);
+            // A continuation line begins with folding whitespace.
+            current = ` ${token}`;
+        } else {
+            current += ` ${token}`;
+        }
+    }
+    lines.push(current);
+    return lines.join('\r\n');
+}
+
+/**
+ * Emit a `Subject:` field, RFC 2047 encoded when the value is not ASCII.
  *
  * A long non-ASCII subject used to become one encoded-word of arbitrary
- * length. RFC 2047 caps an encoded-word at 75 characters, and clients that
- * enforce it render the overflow as literal `=?UTF-8?B?...` text. The value is
- * now split into conforming encoded-words folded onto continuation lines.
+ * length; RFC 2047 caps an encoded-word at 75 characters and the line carrying
+ * it at 76, and clients that enforce either render the overflow as literal
+ * `=?UTF-8?B?...` text. The value is split into conforming encoded-words
+ * folded onto continuation lines. ASCII subjects are folded on whitespace by
+ * the shared path rather than returned unfolded.
  */
-function encodeEmailHeader(text: string): string {
-    if (isAscii(text)) return text;
+function encodeSubjectField(text: string): string {
+    if (isAscii(text)) return foldHeaderField('Subject', text);
 
-    return chunkByBytes(text, ENCODED_WORD_PAYLOAD_BYTES)
-        .map(chunk => `=?UTF-8?B?${Buffer.from(chunk, 'utf8').toString('base64')}?=`)
-        // A CRLF + space folds the header; adjacent encoded-words separated by
-        // folding whitespace are concatenated without a space by the decoder.
-        .join('\r\n ');
+    const words = chunkByBytes(text, ENCODED_WORD_PAYLOAD_BYTES)
+        .map(chunk => `=?UTF-8?B?${Buffer.from(chunk, 'utf8').toString('base64')}?=`);
+
+    // A CRLF + space folds the header; adjacent encoded-words separated by
+    // folding whitespace are concatenated without a space by the decoder.
+    return `Subject: ${words.join('\r\n ')}`;
+}
+
+/**
+ * True when `text` can honestly be labelled `Content-Transfer-Encoding: 7bit`.
+ *
+ * Non-ASCII is 8-bit by definition. RFC 2045 §2.7 additionally forbids NUL and
+ * the other C0 controls in a 7bit body, and allows CR and LF only as a CRLF
+ * pair — an ASCII-range check alone lets `a\u0000b` through and declares it
+ * 7bit. Bare LF is not disqualifying here because the caller's line endings
+ * are normalised to CRLF before emission.
+ */
+function is7BitClean(text: string): boolean {
+    if (!isAscii(text)) return false;
+    // Everything below 0x20 except TAB, CR and LF, plus DEL.
+    return !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text);
 }
 
 /**
@@ -84,8 +138,10 @@ export function encodeBodyPart(content: string): { encoding: string; body: strin
     const text = content ?? '';
     const tooLong = text.split(/\r?\n/).some(line => line.length > MAX_LINE_LENGTH);
 
-    if (isAscii(text) && !tooLong) {
-        return { encoding: '7bit', body: text };
+    if (is7BitClean(text) && !tooLong) {
+        // The message is assembled with CRLF separators, so a body carrying
+        // bare LF would leave mixed line endings inside the part.
+        return { encoding: '7bit', body: text.replace(/\r\n|\r|\n/g, '\r\n') };
     }
 
     const base64 = Buffer.from(text, 'utf8').toString('base64');
@@ -110,7 +166,7 @@ function sanitizeHeaderValue(value: string): string {
 }
 
 export function createEmailMessage(validatedArgs: any): string {
-    const encodedSubject = encodeEmailHeader(sanitizeHeaderValue(validatedArgs.subject));
+    const subjectField = encodeSubjectField(sanitizeHeaderValue(validatedArgs.subject));
     // Determine content type based on available content and explicit mimeType
     let mimeType = validatedArgs.mimeType || 'text/plain';
     
@@ -140,15 +196,19 @@ export function createEmailMessage(validatedArgs: any): string {
         ? sanitizeHeaderValue(validatedArgs.references)
         : validatedArgs.inReplyTo ? sanitizeHeaderValue(validatedArgs.inReplyTo) : '';
 
-    // Common email headers
+    // Common email headers. Every field is folded: the 998-character limit is
+    // on the whole line, so the header name counts against it, and an address
+    // list of up to 100 recipients runs to several thousand characters.
     const emailParts = [
-        `From: ${from}`,
-        `To: ${to}`,
-        cc ? `Cc: ${cc}` : '',
-        bcc ? `Bcc: ${bcc}` : '',
-        `Subject: ${encodedSubject}`,
-        inReplyTo ? `In-Reply-To: ${inReplyTo}` : '',
-        references ? `References: ${references}` : '',
+        foldHeaderField('From', from),
+        // A cc-only or bcc-only send has no To: recipients; emitting an empty
+        // `To: ` header is malformed, so omit the field entirely.
+        to ? foldHeaderField('To', to) : '',
+        cc ? foldHeaderField('Cc', cc) : '',
+        bcc ? foldHeaderField('Bcc', bcc) : '',
+        subjectField,
+        inReplyTo ? foldHeaderField('In-Reply-To', inReplyTo) : '',
+        references ? foldHeaderField('References', references) : '',
         'MIME-Version: 1.0',
     ].filter(Boolean);
 

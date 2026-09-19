@@ -7,7 +7,19 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 // counters directly (batchSize: 0 spun processBatches forever; a negative or
 // fractional maxResults silently returned nothing), and unbounded arrays let a
 // single tool call fan out into thousands of Gmail API requests.
+//
+// The helpers below are FACTORIES, not shared instances. Reusing one zod
+// object across fields makes zodToJsonSchema deduplicate by identity and emit
+// `$ref` — and JSON Schema draft-07, which these schemas declare, requires
+// keywords beside a `$ref` to be ignored. The per-field `description` was
+// therefore dropped and the model read the target's instead, so
+// `removeLabelIds` documented itself as "label IDs to apply" and `bcc` as
+// "List of CC recipients". A fresh instance per field keeps each description.
 const MAX_ID_LENGTH = 512;
+// Gmail attachment IDs are long opaque base64url blobs, routinely 600+
+// characters — capping them at MAX_ID_LENGTH made download_attachment
+// unusable for exactly the large attachments it exists to fetch.
+const MAX_ATTACHMENT_ID_LENGTH = 4096;
 const MAX_EMAIL_LENGTH = 320; // RFC 5321 local-part + domain ceiling
 const MAX_RECIPIENTS = 100;
 const MAX_MESSAGE_IDS = 1000; // Gmail batchModify/batchDelete cap
@@ -15,25 +27,49 @@ const MAX_LABEL_IDS = 100;
 const MAX_ATTACHMENTS = 25;
 const MAX_INLINE_IMAGES = 50;
 const MAX_QUERY_LENGTH = 2048;
-const MAX_SUBJECT_LENGTH = 998; // RFC 5322 line-length ceiling
+// Header values are folded before emission, so this bounds the value itself
+// rather than the wire line; see foldHeaderField() in utl.ts.
+const MAX_SUBJECT_LENGTH = 998;
+const MAX_MESSAGE_ID_HEADER_LENGTH = 998;
 const MAX_BODY_LENGTH = 10 * 1024 * 1024;
+// The decoded ceiling enforced in utl.ts is 10 MiB. `content` is base64, which
+// is 4 characters per 3 bytes — bounding the STRING at 10 MiB capped decoded
+// images at 7.5 MiB and made the decoded guard unreachable from any tool path.
+const MAX_INLINE_IMAGE_BASE64_LENGTH = Math.ceil((10 * 1024 * 1024) / 3) * 4;
 const MAX_PATH_LENGTH = 4096;
 const MAX_FILENAME_LENGTH = 255;
 const MAX_BATCH_SIZE = 100;
 const MAX_PAGE_SIZE = 500; // Gmail maxResults ceiling
 
-const idString = z.string().min(1).max(MAX_ID_LENGTH);
-const emailString = z.string().min(1).max(MAX_EMAIL_LENGTH);
-const bodyString = z.string().max(MAX_BODY_LENGTH);
-const subjectString = z.string().max(MAX_SUBJECT_LENGTH);
-const queryString = z.string().max(MAX_QUERY_LENGTH);
-const pathString = z.string().min(1).max(MAX_PATH_LENGTH);
-const labelIdArray = z.array(idString).max(MAX_LABEL_IDS);
-const recipientArray = z.array(emailString).max(MAX_RECIPIENTS);
-const attachmentPathArray = z.array(pathString).max(MAX_ATTACHMENTS);
-const batchSizeNumber = z.number().int().min(1).max(MAX_BATCH_SIZE);
-const pageSizeNumber = z.number().int().min(1).max(MAX_PAGE_SIZE);
-const byteSizeNumber = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const idString = () => z.string().min(1).max(MAX_ID_LENGTH);
+const attachmentIdString = () => z.string().min(1).max(MAX_ATTACHMENT_ID_LENGTH);
+const emailString = () => z.string().min(1).max(MAX_EMAIL_LENGTH);
+const bodyString = () => z.string().max(MAX_BODY_LENGTH);
+const subjectString = () => z.string().max(MAX_SUBJECT_LENGTH);
+const messageIdHeaderString = () => z.string().min(1).max(MAX_MESSAGE_ID_HEADER_LENGTH);
+const queryString = () => z.string().max(MAX_QUERY_LENGTH);
+const pathString = () => z.string().min(1).max(MAX_PATH_LENGTH);
+const labelNameString = () => z.string().min(1).max(MAX_FILENAME_LENGTH);
+const labelIdArray = () => z.array(idString()).max(MAX_LABEL_IDS);
+const recipientArray = () => z.array(emailString()).max(MAX_RECIPIENTS);
+const messageIdArray = () => z.array(idString()).min(1).max(MAX_MESSAGE_IDS);
+const attachmentPathArray = () => z.array(pathString()).max(MAX_ATTACHMENTS);
+const batchSizeNumber = () => z.number().int().min(1).max(MAX_BATCH_SIZE);
+const pageSizeNumber = () => z.number().int().min(1).max(MAX_PAGE_SIZE);
+const byteSizeNumber = () => z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+
+/**
+ * A message needs at least one recipient somewhere — but a cc-only send and a
+ * bcc-only broadcast are both legitimate, so requiring `to` to be non-empty
+ * blocked them outright. Check across the three fields instead.
+ */
+const hasAnyRecipient = (d: { to?: string[]; cc?: string[]; bcc?: string[] }) =>
+  (d.to?.length ?? 0) + (d.cc?.length ?? 0) + (d.bcc?.length ?? 0) > 0;
+
+const RECIPIENT_REQUIRED = {
+  message: 'At least one recipient is required across `to`, `cc` and `bcc`',
+  path: ['to'],
+};
 
 // Schema definitions
 
@@ -42,8 +78,8 @@ const byteSizeNumber = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 export const InlineImageSchema = z.object({
   cid: z.string().min(1).max(MAX_ID_LENGTH).regex(/^[^\s<>]+$/, "cid must not contain whitespace or angle brackets")
     .describe("Content-ID for the image, referenced from htmlBody as <img src=\"cid:CID\">"),
-  path: pathString.optional().describe("Absolute file path to the image (use this OR content)"),
-  content: z.string().max(MAX_BODY_LENGTH).optional().describe("Base64-encoded image data (use this OR path)"),
+  path: pathString().optional().describe("Absolute file path to the image (use this OR content)"),
+  content: z.string().max(MAX_INLINE_IMAGE_BASE64_LENGTH).optional().describe("Base64-encoded image data (use this OR path)"),
   contentType: z.enum(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/x-icon']).optional()
     .describe("Image MIME type — required when using `content`. SVG is intentionally unsupported."),
   filename: z.string().min(1).max(MAX_FILENAME_LENGTH).optional().describe("Display filename for the image part (defaults derived from path or cid)"),
@@ -55,152 +91,152 @@ export const InlineImageSchema = z.object({
     message: "`contentType` is required when an inline image uses `content`",
   });
 
-const inlineImageArray = z.array(InlineImageSchema).max(MAX_INLINE_IMAGES);
+const inlineImageArray = () => z.array(InlineImageSchema).max(MAX_INLINE_IMAGES);
 
 export const SendEmailSchema = z.object({
-  to: recipientArray.min(1).describe("List of recipient email addresses"),
-  subject: subjectString.describe("Email subject"),
-  body: bodyString.describe("Email body content (used for text/plain or when htmlBody not provided)"),
-  from: emailString.optional().describe("Sender email address (must be a configured send-as alias in Gmail settings). Defaults to account's default send-as address if not specified."),
-  htmlBody: bodyString.optional().describe("HTML version of the email body"),
+  to: recipientArray().optional().default([]).describe("List of recipient email addresses (may be empty for a cc-only or bcc-only send)"),
+  subject: subjectString().describe("Email subject"),
+  body: bodyString().describe("Email body content (used for text/plain or when htmlBody not provided)"),
+  from: emailString().optional().describe("Sender email address (must be a configured send-as alias in Gmail settings). Defaults to account's default send-as address if not specified."),
+  htmlBody: bodyString().optional().describe("HTML version of the email body"),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
-  cc: recipientArray.optional().describe("List of CC recipients"),
-  bcc: recipientArray.optional().describe("List of BCC recipients"),
-  threadId: idString.optional().describe("Thread ID to reply to"),
-  inReplyTo: z.string().min(1).max(MAX_SUBJECT_LENGTH).optional().describe("Message ID being replied to"),
-  attachments: attachmentPathArray.optional().describe("List of file paths to attach to the email"),
-  inlineImages: inlineImageArray.optional().describe("Images embedded inline in the HTML body, each referenced from htmlBody as <img src=\"cid:CID\">. Requires htmlBody to be set."),
-});
+  cc: recipientArray().optional().describe("List of CC recipients"),
+  bcc: recipientArray().optional().describe("List of BCC recipients"),
+  threadId: idString().optional().describe("Thread ID to reply to"),
+  inReplyTo: messageIdHeaderString().optional().describe("Message ID being replied to"),
+  attachments: attachmentPathArray().optional().describe("List of file paths to attach to the email"),
+  inlineImages: inlineImageArray().optional().describe("Images embedded inline in the HTML body, each referenced from htmlBody as <img src=\"cid:CID\">. Requires htmlBody to be set."),
+}).refine(hasAnyRecipient, RECIPIENT_REQUIRED);
 
 export const ReadEmailSchema = z.object({
-  messageId: idString.describe("ID of the email message to retrieve"),
+  messageId: idString().describe("ID of the email message to retrieve"),
 });
 
 export const SearchEmailsSchema = z.object({
-  query: queryString.describe("Gmail search query (e.g., 'from:example@gmail.com')"),
-  maxResults: pageSizeNumber.optional().describe("Maximum number of results to return (1-500, default: 10)"),
+  query: queryString().describe("Gmail search query (e.g., 'from:example@gmail.com')"),
+  maxResults: pageSizeNumber().optional().describe("Maximum number of results to return (1-500, default: 10)"),
 });
 
 export const ModifyEmailSchema = z.object({
-  messageId: idString.describe("ID of the email message to modify"),
-  labelIds: labelIdArray.optional().describe("List of label IDs to apply"),
-  addLabelIds: labelIdArray.optional().describe("List of label IDs to add to the message"),
-  removeLabelIds: labelIdArray.optional().describe("List of label IDs to remove from the message"),
+  messageId: idString().describe("ID of the email message to modify"),
+  labelIds: labelIdArray().optional().describe("List of label IDs to apply"),
+  addLabelIds: labelIdArray().optional().describe("List of label IDs to add to the message"),
+  removeLabelIds: labelIdArray().optional().describe("List of label IDs to remove from the message"),
 });
 
 export const DeleteEmailSchema = z.object({
-  messageId: idString.describe("ID of the email message to delete"),
+  messageId: idString().describe("ID of the email message to delete"),
 });
 
 // Draft lifecycle schemas
 export const SendDraftSchema = z.object({
-  draftId: idString.describe("ID of the draft to send (returned by draft_email)"),
+  draftId: idString().describe("ID of the draft to send (returned by draft_email)"),
 });
 
 export const DeleteDraftSchema = z.object({
-  draftId: idString.describe("ID of the draft to delete"),
+  draftId: idString().describe("ID of the draft to delete"),
 });
 
 export const UpdateDraftSchema = z.object({
-  draftId: idString.describe("ID of the draft to update"),
-  to: recipientArray.min(1).describe("List of recipient email addresses"),
-  subject: subjectString.describe("Email subject"),
-  body: bodyString.describe("Email body content (used for text/plain or when htmlBody not provided)"),
-  from: emailString.optional().describe("Sender email address (must be a configured send-as alias in Gmail settings). Defaults to account's default send-as address if not specified."),
-  htmlBody: bodyString.optional().describe("HTML version of the email body"),
+  draftId: idString().describe("ID of the draft to update"),
+  to: recipientArray().optional().default([]).describe("List of recipient email addresses (may be empty for a cc-only or bcc-only send)"),
+  subject: subjectString().describe("Email subject"),
+  body: bodyString().describe("Email body content (used for text/plain or when htmlBody not provided)"),
+  from: emailString().optional().describe("Sender email address (must be a configured send-as alias in Gmail settings). Defaults to account's default send-as address if not specified."),
+  htmlBody: bodyString().optional().describe("HTML version of the email body"),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
-  cc: recipientArray.optional().describe("List of CC recipients"),
-  bcc: recipientArray.optional().describe("List of BCC recipients"),
-  threadId: idString.optional().describe("Thread ID to reply to"),
-  inReplyTo: z.string().min(1).max(MAX_SUBJECT_LENGTH).optional().describe("Message ID being replied to"),
-  attachments: attachmentPathArray.optional().describe("List of file paths to attach to the email"),
-  inlineImages: inlineImageArray.optional().describe("Images embedded inline in the HTML body, each referenced from htmlBody as <img src=\"cid:CID\">. Requires htmlBody to be set."),
-});
+  cc: recipientArray().optional().describe("List of CC recipients"),
+  bcc: recipientArray().optional().describe("List of BCC recipients"),
+  threadId: idString().optional().describe("Thread ID to reply to"),
+  inReplyTo: messageIdHeaderString().optional().describe("Message ID being replied to"),
+  attachments: attachmentPathArray().optional().describe("List of file paths to attach to the email"),
+  inlineImages: inlineImageArray().optional().describe("Images embedded inline in the HTML body, each referenced from htmlBody as <img src=\"cid:CID\">. Requires htmlBody to be set."),
+}).refine(hasAnyRecipient, RECIPIENT_REQUIRED);
 
 export const ListEmailLabelsSchema = z.object({}).describe("Retrieves all available Gmail labels");
 
 export const CreateLabelSchema = z.object({
-  name: z.string().min(1).max(MAX_FILENAME_LENGTH).describe("Name for the new label"),
+  name: labelNameString().describe("Name for the new label"),
   messageListVisibility: z.enum(['show', 'hide']).optional().describe("Whether to show or hide the label in the message list"),
   labelListVisibility: z.enum(['labelShow', 'labelShowIfUnread', 'labelHide']).optional().describe("Visibility of the label in the label list"),
 }).describe("Creates a new Gmail label");
 
 export const UpdateLabelSchema = z.object({
-  id: idString.describe("ID of the label to update"),
-  name: z.string().min(1).max(MAX_FILENAME_LENGTH).optional().describe("New name for the label"),
+  id: idString().describe("ID of the label to update"),
+  name: labelNameString().optional().describe("New name for the label"),
   messageListVisibility: z.enum(['show', 'hide']).optional().describe("Whether to show or hide the label in the message list"),
   labelListVisibility: z.enum(['labelShow', 'labelShowIfUnread', 'labelHide']).optional().describe("Visibility of the label in the label list"),
 }).describe("Updates an existing Gmail label");
 
 export const DeleteLabelSchema = z.object({
-  id: idString.describe("ID of the label to delete"),
+  id: idString().describe("ID of the label to delete"),
 }).describe("Deletes a Gmail label");
 
 export const GetOrCreateLabelSchema = z.object({
-  name: z.string().min(1).max(MAX_FILENAME_LENGTH).describe("Name of the label to get or create"),
+  name: labelNameString().describe("Name of the label to get or create"),
   messageListVisibility: z.enum(['show', 'hide']).optional().describe("Whether to show or hide the label in the message list"),
   labelListVisibility: z.enum(['labelShow', 'labelShowIfUnread', 'labelHide']).optional().describe("Visibility of the label in the label list"),
 }).describe("Gets an existing label by name or creates it if it doesn't exist");
 
 export const BatchModifyEmailsSchema = z.object({
-  messageIds: z.array(idString).min(1).max(MAX_MESSAGE_IDS).describe("List of message IDs to modify"),
-  addLabelIds: labelIdArray.optional().describe("List of label IDs to add to all messages"),
-  removeLabelIds: labelIdArray.optional().describe("List of label IDs to remove from all messages"),
-  batchSize: batchSizeNumber.optional().default(50).describe("Number of messages to process in each batch (1-100, default: 50)"),
+  messageIds: messageIdArray().describe("List of message IDs to modify"),
+  addLabelIds: labelIdArray().optional().describe("List of label IDs to add to all messages"),
+  removeLabelIds: labelIdArray().optional().describe("List of label IDs to remove from all messages"),
+  batchSize: batchSizeNumber().optional().default(50).describe("Number of messages to process in each batch (1-100, default: 50)"),
 });
 
 export const ReportPhishingSchema = z.object({
-  messageId: idString.describe("ID of the email message to report as phishing"),
+  messageId: idString().describe("ID of the email message to report as phishing"),
 }).describe("Reports a message as phishing using the closest public Gmail API behavior by applying the SPAM label");
 
 export const BatchReportPhishingSchema = z.object({
-  messageIds: z.array(idString).min(1).max(MAX_MESSAGE_IDS).describe("List of message IDs to report as phishing"),
-  batchSize: batchSizeNumber.optional().default(50).describe("Number of messages to process in each batch (1-100, default: 50)"),
+  messageIds: messageIdArray().describe("List of message IDs to report as phishing"),
+  batchSize: batchSizeNumber().optional().default(50).describe("Number of messages to process in each batch (1-100, default: 50)"),
 }).describe("Reports multiple messages as phishing using the closest public Gmail API behavior by applying the SPAM label");
 
 export const BatchDeleteEmailsSchema = z.object({
-  messageIds: z.array(idString).min(1).max(MAX_MESSAGE_IDS).describe("List of message IDs to delete"),
-  batchSize: batchSizeNumber.optional().default(50).describe("Number of messages to process in each batch (1-100, default: 50)"),
+  messageIds: messageIdArray().describe("List of message IDs to delete"),
+  batchSize: batchSizeNumber().optional().default(50).describe("Number of messages to process in each batch (1-100, default: 50)"),
 });
 
 export const CreateFilterSchema = z.object({
   criteria: z.object({
     from: z.string().max(MAX_QUERY_LENGTH).optional().describe("Sender email address to match"),
     to: z.string().max(MAX_QUERY_LENGTH).optional().describe("Recipient email address to match"),
-    subject: subjectString.optional().describe("Subject text to match"),
-    query: queryString.optional().describe("Gmail search query (e.g., 'has:attachment')"),
-    negatedQuery: queryString.optional().describe("Text that must NOT be present"),
+    subject: subjectString().optional().describe("Subject text to match"),
+    query: queryString().optional().describe("Gmail search query (e.g., 'has:attachment')"),
+    negatedQuery: queryString().optional().describe("Text that must NOT be present"),
     hasAttachment: z.boolean().optional().describe("Whether to match emails with attachments"),
     excludeChats: z.boolean().optional().describe("Whether to exclude chat messages"),
-    size: byteSizeNumber.optional().describe("Email size in bytes"),
+    size: byteSizeNumber().optional().describe("Email size in bytes"),
     sizeComparison: z.enum(['unspecified', 'smaller', 'larger']).optional().describe("Size comparison operator")
   }).describe("Criteria for matching emails"),
   action: z.object({
-    addLabelIds: labelIdArray.optional().describe("Label IDs to add to matching emails"),
-    removeLabelIds: labelIdArray.optional().describe("Label IDs to remove from matching emails"),
-    forward: emailString.optional().describe("Email address to forward matching emails to")
+    addLabelIds: labelIdArray().optional().describe("Label IDs to add to matching emails"),
+    removeLabelIds: labelIdArray().optional().describe("Label IDs to remove from matching emails"),
+    forward: emailString().optional().describe("Email address to forward matching emails to")
   }).describe("Actions to perform on matching emails")
 }).describe("Creates a new Gmail filter");
 
 export const ListFiltersSchema = z.object({}).describe("Retrieves all Gmail filters");
 
 export const GetFilterSchema = z.object({
-  filterId: idString.describe("ID of the filter to retrieve")
+  filterId: idString().describe("ID of the filter to retrieve")
 }).describe("Gets details of a specific Gmail filter");
 
 export const DeleteFilterSchema = z.object({
-  filterId: idString.describe("ID of the filter to delete")
+  filterId: idString().describe("ID of the filter to delete")
 }).describe("Deletes a Gmail filter");
 
 export const CreateFilterFromTemplateSchema = z.object({
   template: z.enum(['fromSender', 'withSubject', 'withAttachments', 'largeEmails', 'containingText', 'mailingList']).describe("Pre-defined filter template to use"),
   parameters: z.object({
-    senderEmail: emailString.optional().describe("Sender email (for fromSender template)"),
-    subjectText: subjectString.optional().describe("Subject text (for withSubject template)"),
-    searchText: queryString.optional().describe("Text to search for (for containingText template)"),
+    senderEmail: emailString().optional().describe("Sender email (for fromSender template)"),
+    subjectText: subjectString().optional().describe("Subject text (for withSubject template)"),
+    searchText: queryString().optional().describe("Text to search for (for containingText template)"),
     listIdentifier: z.string().min(1).max(MAX_QUERY_LENGTH).optional().describe("Mailing list identifier (for mailingList template)"),
-    sizeInBytes: byteSizeNumber.optional().describe("Size threshold in bytes (for largeEmails template)"),
-    labelIds: labelIdArray.optional().describe("Label IDs to apply"),
+    sizeInBytes: byteSizeNumber().optional().describe("Size threshold in bytes (for largeEmails template)"),
+    labelIds: labelIdArray().optional().describe("Label IDs to apply"),
     archive: z.boolean().optional().describe("Whether to archive (skip inbox)"),
     markAsRead: z.boolean().optional().describe("Whether to mark as read"),
     markImportant: z.boolean().optional().describe("Whether to mark as important")
@@ -208,63 +244,63 @@ export const CreateFilterFromTemplateSchema = z.object({
 }).describe("Creates a filter using a pre-defined template");
 
 export const DownloadAttachmentSchema = z.object({
-  messageId: idString.describe("ID of the email message containing the attachment"),
-  attachmentId: idString.describe("ID of the attachment to download"),
+  messageId: idString().describe("ID of the email message containing the attachment"),
+  attachmentId: attachmentIdString().describe("ID of the attachment to download"),
   filename: z.string().min(1).max(MAX_FILENAME_LENGTH).optional().describe("Filename to save the attachment as (if not provided, uses original filename)"),
-  savePath: pathString.optional().describe("Directory path to save the attachment (defaults to current directory)"),
+  savePath: pathString().optional().describe("Directory path to save the attachment (defaults to current directory)"),
 });
 
 export const DownloadEmailSchema = z.object({
-  messageId: idString.describe("ID of the email message to download"),
-  savePath: pathString.describe("Directory path to save the email file"),
+  messageId: idString().describe("ID of the email message to download"),
+  savePath: pathString().describe("Directory path to save the email file"),
   format: z.enum(['json', 'eml', 'txt', 'html']).optional().default('json')
     .describe("Output format: json (structured data), eml (raw RFC822), txt (plain text), html (formatted HTML)"),
 });
 
 export const ModifyThreadSchema = z.object({
-  threadId: idString.describe("ID of the Gmail thread to modify"),
-  addLabelIds: labelIdArray.optional().describe("List of label IDs to add to all messages in the thread"),
-  removeLabelIds: labelIdArray.optional().describe("List of label IDs to remove from all messages in the thread"),
+  threadId: idString().describe("ID of the Gmail thread to modify"),
+  addLabelIds: labelIdArray().optional().describe("List of label IDs to add to all messages in the thread"),
+  removeLabelIds: labelIdArray().optional().describe("List of label IDs to remove from all messages in the thread"),
 });
 
 // Thread-level schemas
 export const GetThreadSchema = z.object({
-  threadId: idString.describe("ID of the email thread to retrieve"),
+  threadId: idString().describe("ID of the email thread to retrieve"),
   format: z.enum(['full', 'metadata', 'minimal']).optional().default('full').describe("Format of the email messages returned (default: full)"),
 });
 
 export const ListInboxThreadsSchema = z.object({
-  query: queryString.optional().default('in:inbox').describe("Gmail search query (default: 'in:inbox')"),
-  maxResults: pageSizeNumber.optional().default(50).describe("Maximum number of threads to return (1-500, default: 50)"),
+  query: queryString().optional().default('in:inbox').describe("Gmail search query (default: 'in:inbox')"),
+  maxResults: pageSizeNumber().optional().default(50).describe("Maximum number of threads to return (1-500, default: 50)"),
 });
 
 export const GetInboxWithThreadsSchema = z.object({
-  query: queryString.optional().default('in:inbox').describe("Gmail search query (default: 'in:inbox')"),
-  maxResults: pageSizeNumber.optional().default(50).describe("Maximum number of threads to return (1-500, default: 50)"),
+  query: queryString().optional().default('in:inbox').describe("Gmail search query (default: 'in:inbox')"),
+  maxResults: pageSizeNumber().optional().default(50).describe("Maximum number of threads to return (1-500, default: 50)"),
   expandThreads: z.boolean().optional().default(true).describe("Whether to fetch full thread content for each thread (default: true)"),
 });
 
 // Reply All schema - fetches original email and builds recipient list automatically
 export const ReplyAllSchema = z.object({
-  messageId: idString.describe("ID of the email message to reply to"),
-  body: bodyString.describe("Reply body content (used for text/plain or when htmlBody not provided)"),
-  htmlBody: bodyString.optional().describe("HTML version of the reply body"),
+  messageId: idString().describe("ID of the email message to reply to"),
+  body: bodyString().describe("Reply body content (used for text/plain or when htmlBody not provided)"),
+  htmlBody: bodyString().optional().describe("HTML version of the reply body"),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
-  attachments: attachmentPathArray.optional().describe("List of file paths to attach to the reply"),
-  inlineImages: inlineImageArray.optional().describe("Images embedded inline in the HTML body, each referenced from htmlBody as <img src=\"cid:CID\">. Requires htmlBody to be set."),
+  attachments: attachmentPathArray().optional().describe("List of file paths to attach to the reply"),
+  inlineImages: inlineImageArray().optional().describe("Images embedded inline in the HTML body, each referenced from htmlBody as <img src=\"cid:CID\">. Requires htmlBody to be set."),
 });
 
 // Forward schema - fetches the original email and re-sends it to new recipients
 export const ForwardEmailSchema = z.object({
-  messageId: idString.describe("ID of the email message to forward"),
-  to: recipientArray.min(1).describe("List of recipient email addresses to forward to"),
-  cc: recipientArray.optional().describe("List of CC recipients"),
-  bcc: recipientArray.optional().describe("List of BCC recipients"),
-  from: emailString.optional().describe("Sender email address (must be a configured send-as alias in Gmail settings). Defaults to account's default send-as address if not specified."),
-  body: bodyString.optional().describe("Optional note placed above the quoted original message"),
-  htmlBody: bodyString.optional().describe("HTML version of the optional note. Only used when the original message has an HTML body."),
+  messageId: idString().describe("ID of the email message to forward"),
+  to: recipientArray().optional().default([]).describe("List of recipient email addresses to forward to (may be empty for a cc-only or bcc-only forward)"),
+  cc: recipientArray().optional().describe("List of CC recipients"),
+  bcc: recipientArray().optional().describe("List of BCC recipients"),
+  from: emailString().optional().describe("Sender email address (must be a configured send-as alias in Gmail settings). Defaults to account's default send-as address if not specified."),
+  body: bodyString().optional().describe("Optional note placed above the quoted original message"),
+  htmlBody: bodyString().optional().describe("HTML version of the optional note. Only used when the original message has an HTML body."),
   includeAttachments: z.boolean().optional().default(true).describe("Carry the original message's attachments and inline images over to the forwarded copy"),
-});
+}).refine(hasAnyRecipient, RECIPIENT_REQUIRED);
 
 // Tool definition type
 export interface ToolAnnotations {
