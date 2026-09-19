@@ -35,8 +35,14 @@ afterEach(() => {
     if (home) fs.rmSync(home, { recursive: true, force: true });
 });
 
-/** Run the CLI to completion and capture both streams. */
-function run(args: string[], ms = 6000): Promise<{ code: number | null; stdout: string; stderr: string }> {
+/**
+ * Run the CLI to completion and capture both streams.
+ *
+ * The kill deadline stays under vitest's 5s per-test budget: a longer one
+ * means a hung process trips the test timeout first, and the failure reads as
+ * "Test timed out" with none of the stderr that would say why.
+ */
+function run(args: string[], ms = 4000): Promise<{ code: number | null; stdout: string; stderr: string }> {
     return new Promise((resolve) => {
         const proc = spawn('node', [ENTRY, ...args], {
             cwd: REPO_ROOT,
@@ -117,7 +123,7 @@ describe.skipIf(!built)('unreadable credentials are recoverable', () => {
 });
 
 describe.skipIf(!built)('unauthenticated server', () => {
-    it('says what to run instead of surfacing a library internal', async () => {
+    it('says what to run instead of surfacing a library internal', { timeout: 30_000 }, async () => {
         // Previously every call returned google-auth-library's "No access,
         // refresh token, API key or refresh handler callback is set." — which
         // never mentions Gmail, credentials, or auth.
@@ -126,24 +132,45 @@ describe.skipIf(!built)('unauthenticated server', () => {
             env: { ...process.env, HOME: home },
             stdio: ['pipe', 'pipe', 'pipe'],
         });
+
         let out = '';
         proc.stdout.on('data', d => { out += d; });
         const send = (o: unknown) => proc.stdin.write(JSON.stringify(o) + '\n');
 
-        send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } } });
-        await new Promise(r => setTimeout(r, 300));
-        send({ jsonrpc: '2.0', method: 'notifications/initialized' });
-        await new Promise(r => setTimeout(r, 200));
-        send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'search_emails', arguments: { query: 'x' } } });
-        await new Promise(r => setTimeout(r, 900));
-        proc.kill('SIGKILL');
+        // Wait for each reply rather than sleeping a fixed span: a slower
+        // machine simply missed them, which is how this suite first went red
+        // on CI while passing locally.
+        const reply = (id: number) => new Promise<any>((resolve, reject) => {
+            const started = Date.now();
+            const tick = () => {
+                for (const line of out.split('\n').filter(Boolean)) {
+                    try {
+                        const message = JSON.parse(line);
+                        if (message.id === id) return resolve(message);
+                    } catch { /* partial line */ }
+                }
+                if (Date.now() - started > 20_000) {
+                    return reject(new Error(`no reply to id ${id}; stdout was:\n${out}`));
+                }
+                setTimeout(tick, 50);
+            };
+            tick();
+        });
 
-        const reply = out.split('\n').filter(Boolean).map(l => JSON.parse(l)).find(m => m.id === 2);
-        const text = reply.result.content[0].text;
+        try {
+            send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } } });
+            await reply(1);
+            send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+            send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'search_emails', arguments: { query: 'x' } } });
+            const call = await reply(2);
 
-        expect(text).toMatch(/Not authenticated/);
-        expect(text).toMatch(/auth/);
-        expect(text).not.toMatch(/refresh handler callback/);
+            const text = call.result.content[0].text;
+            expect(text).toMatch(/Not authenticated/);
+            expect(text).toMatch(/auth/);
+            expect(text).not.toMatch(/refresh handler callback/);
+        } finally {
+            proc.kill('SIGKILL');
+        }
     });
 });
 
