@@ -10,17 +10,146 @@ import nodemailer from 'nodemailer';
  */
 export const MAX_INLINE_IMAGE_CONTENT_BYTES = 10 * 1024 * 1024;
 
+/** RFC 5322 caps a line at 998 characters excluding CRLF. */
+const MAX_LINE_LENGTH = 998;
+
+/** RFC 2045 line length for base64-encoded bodies. */
+const BASE64_LINE_LENGTH = 76;
+
 /**
- * Helper function to encode email headers containing non-ASCII characters
- * according to RFC 2047 MIME specification
+ * RFC 2047 caps a header LINE containing encoded-words at 76 characters — not
+ * just the encoded-word itself. Sizing the payload from the longest header
+ * name this builder emits keeps the first line inside that limit whichever
+ * header the value lands in.
+ *
+ * Budget: 76 - len('In-Reply-To: ') = 63 characters for the word. Minus the
+ * '=?UTF-8?B?' + '?=' delimiters (12) leaves 51 for base64, rounded down to a
+ * multiple of 4 -> 48 characters -> 36 bytes of input. First line: 13 + 60 = 73.
  */
-function encodeEmailHeader(text: string): string {
-    // Only encode if the text contains non-ASCII characters
-    if (/[^\x00-\x7F]/.test(text)) {
-        // Use MIME Words encoding (RFC 2047)
-        return '=?UTF-8?B?' + Buffer.from(text).toString('base64') + '?=';
+const ENCODED_WORD_PAYLOAD_BYTES = 36;
+
+function isAscii(text: string): boolean {
+    return !/[^\x00-\x7F]/.test(text);
+}
+
+/**
+ * Split a string into chunks of at most `maxBytes` UTF-8 bytes without cutting
+ * a character in half. A split multi-byte sequence would decode to U+FFFD in
+ * the recipient's client.
+ */
+function chunkByBytes(text: string, maxBytes: number): string[] {
+    const chunks: string[] = [];
+    let current = '';
+    let used = 0;
+
+    // Iterating a string yields whole code points, keeping surrogate pairs intact.
+    for (const char of text) {
+        const width = Buffer.byteLength(char);
+        if (used + width > maxBytes) {
+            chunks.push(current);
+            current = '';
+            used = 0;
+        }
+        current += char;
+        used += width;
     }
-    return text;
+    if (current) chunks.push(current);
+    return chunks.length > 0 ? chunks : [''];
+}
+
+/**
+ * Emit `Name: value`, folded so no line exceeds the RFC 5322 998-character
+ * limit.
+ *
+ * The limit is on the whole LINE, header name included — a 998-character
+ * subject produces a 1007-character `Subject:` line, and a 100-recipient `To:`
+ * runs to several thousand. Folding is only legal at existing whitespace, so a
+ * single token longer than the budget is emitted as-is; there is nowhere to
+ * break it.
+ */
+function foldHeaderField(name: string, value: string): string {
+    const prefix = `${name}:`;
+    if (prefix.length + 1 + value.length <= MAX_LINE_LENGTH) {
+        return `${prefix} ${value}`;
+    }
+
+    const lines: string[] = [];
+    let current = prefix;
+    for (const token of value.split(' ')) {
+        if (current !== prefix && current.length + 1 + token.length > MAX_LINE_LENGTH) {
+            lines.push(current);
+            // A continuation line begins with folding whitespace.
+            current = ` ${token}`;
+        } else {
+            current += ` ${token}`;
+        }
+    }
+    lines.push(current);
+    return lines.join('\r\n');
+}
+
+/**
+ * Emit a `Subject:` field, RFC 2047 encoded when the value is not ASCII.
+ *
+ * A long non-ASCII subject used to become one encoded-word of arbitrary
+ * length; RFC 2047 caps an encoded-word at 75 characters and the line carrying
+ * it at 76, and clients that enforce either render the overflow as literal
+ * `=?UTF-8?B?...` text. The value is split into conforming encoded-words
+ * folded onto continuation lines. ASCII subjects are folded on whitespace by
+ * the shared path rather than returned unfolded.
+ */
+function encodeSubjectField(text: string): string {
+    if (isAscii(text)) return foldHeaderField('Subject', text);
+
+    const words = chunkByBytes(text, ENCODED_WORD_PAYLOAD_BYTES)
+        .map(chunk => `=?UTF-8?B?${Buffer.from(chunk, 'utf8').toString('base64')}?=`);
+
+    // A CRLF + space folds the header; adjacent encoded-words separated by
+    // folding whitespace are concatenated without a space by the decoder.
+    return `Subject: ${words.join('\r\n ')}`;
+}
+
+/**
+ * True when `text` can honestly be labelled `Content-Transfer-Encoding: 7bit`.
+ *
+ * Non-ASCII is 8-bit by definition. RFC 2045 §2.7 additionally forbids NUL and
+ * the other C0 controls in a 7bit body, and allows CR and LF only as a CRLF
+ * pair — an ASCII-range check alone lets `a\u0000b` through and declares it
+ * 7bit. Bare LF is not disqualifying here because the caller's line endings
+ * are normalised to CRLF before emission.
+ */
+function is7BitClean(text: string): boolean {
+    if (!isAscii(text)) return false;
+    // Everything below 0x20 except TAB, CR and LF, plus DEL.
+    return !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text);
+}
+
+/**
+ * Pick a Content-Transfer-Encoding that matches the bytes actually being sent.
+ *
+ * Declaring `7bit` for a UTF-8 body is a lie the recipient's client acts on:
+ * every part was labelled `charset=UTF-8; Content-Transfer-Encoding: 7bit`,
+ * so any non-ASCII body (CJK, accents, emoji) was transmitted as 8-bit octets
+ * under a 7bit declaration. Clients that honour the declaration render mojibake,
+ * and strict MTAs may re-encode or reject the message. Lines over the RFC 5322
+ * 998-character limit are folded by the same path.
+ */
+export function encodeBodyPart(content: string): { encoding: string; body: string } {
+    const text = content ?? '';
+    const tooLong = text.split(/\r?\n/).some(line => line.length > MAX_LINE_LENGTH);
+
+    if (is7BitClean(text) && !tooLong) {
+        // The message is assembled with CRLF separators, so a body carrying
+        // bare LF would leave mixed line endings inside the part.
+        return { encoding: '7bit', body: text.replace(/\r\n|\r|\n/g, '\r\n') };
+    }
+
+    const base64 = Buffer.from(text, 'utf8').toString('base64');
+    const lines: string[] = [];
+    for (let i = 0; i < base64.length; i += BASE64_LINE_LENGTH) {
+        lines.push(base64.slice(i, i + BASE64_LINE_LENGTH));
+    }
+    return { encoding: 'base64', body: lines.join('\r\n') };
 }
 
 export const validateEmail = (email: string): boolean => {
@@ -37,7 +166,7 @@ function sanitizeHeaderValue(value: string): string {
 }
 
 export function createEmailMessage(validatedArgs: any): string {
-    const encodedSubject = encodeEmailHeader(sanitizeHeaderValue(validatedArgs.subject));
+    const subjectField = encodeSubjectField(sanitizeHeaderValue(validatedArgs.subject));
     // Determine content type based on available content and explicit mimeType
     let mimeType = validatedArgs.mimeType || 'text/plain';
     
@@ -67,15 +196,19 @@ export function createEmailMessage(validatedArgs: any): string {
         ? sanitizeHeaderValue(validatedArgs.references)
         : validatedArgs.inReplyTo ? sanitizeHeaderValue(validatedArgs.inReplyTo) : '';
 
-    // Common email headers
+    // Common email headers. Every field is folded: the 998-character limit is
+    // on the whole line, so the header name counts against it, and an address
+    // list of up to 100 recipients runs to several thousand characters.
     const emailParts = [
-        `From: ${from}`,
-        `To: ${to}`,
-        cc ? `Cc: ${cc}` : '',
-        bcc ? `Bcc: ${bcc}` : '',
-        `Subject: ${encodedSubject}`,
-        inReplyTo ? `In-Reply-To: ${inReplyTo}` : '',
-        references ? `References: ${references}` : '',
+        foldHeaderField('From', from),
+        // A cc-only or bcc-only send has no To: recipients; emitting an empty
+        // `To: ` header is malformed, so omit the field entirely.
+        to ? foldHeaderField('To', to) : '',
+        cc ? foldHeaderField('Cc', cc) : '',
+        bcc ? foldHeaderField('Bcc', bcc) : '',
+        subjectField,
+        inReplyTo ? foldHeaderField('In-Reply-To', inReplyTo) : '',
+        references ? foldHeaderField('References', references) : '',
         'MIME-Version: 1.0',
     ].filter(Boolean);
 
@@ -86,35 +219,39 @@ export function createEmailMessage(validatedArgs: any): string {
         emailParts.push('');
         
         // Plain text part
+        const textPart = encodeBodyPart(validatedArgs.body);
         emailParts.push(`--${boundary}`);
         emailParts.push('Content-Type: text/plain; charset=UTF-8');
-        emailParts.push('Content-Transfer-Encoding: 7bit');
+        emailParts.push(`Content-Transfer-Encoding: ${textPart.encoding}`);
         emailParts.push('');
-        emailParts.push(validatedArgs.body);
+        emailParts.push(textPart.body);
         emailParts.push('');
-        
+
         // HTML part
+        const htmlPart = encodeBodyPart(validatedArgs.htmlBody || validatedArgs.body); // Use body as fallback
         emailParts.push(`--${boundary}`);
         emailParts.push('Content-Type: text/html; charset=UTF-8');
-        emailParts.push('Content-Transfer-Encoding: 7bit');
+        emailParts.push(`Content-Transfer-Encoding: ${htmlPart.encoding}`);
         emailParts.push('');
-        emailParts.push(validatedArgs.htmlBody || validatedArgs.body); // Use body as fallback
+        emailParts.push(htmlPart.body);
         emailParts.push('');
         
         // Close the boundary
         emailParts.push(`--${boundary}--`);
     } else if (mimeType === 'text/html') {
         // HTML-only email
+        const htmlOnly = encodeBodyPart(validatedArgs.htmlBody || validatedArgs.body);
         emailParts.push('Content-Type: text/html; charset=UTF-8');
-        emailParts.push('Content-Transfer-Encoding: 7bit');
+        emailParts.push(`Content-Transfer-Encoding: ${htmlOnly.encoding}`);
         emailParts.push('');
-        emailParts.push(validatedArgs.htmlBody || validatedArgs.body);
+        emailParts.push(htmlOnly.body);
     } else {
         // Plain text email (default)
+        const textOnly = encodeBodyPart(validatedArgs.body);
         emailParts.push('Content-Type: text/plain; charset=UTF-8');
-        emailParts.push('Content-Transfer-Encoding: 7bit');
+        emailParts.push(`Content-Transfer-Encoding: ${textOnly.encoding}`);
         emailParts.push('');
-        emailParts.push(validatedArgs.body);
+        emailParts.push(textOnly.body);
     }
 
     return emailParts.join('\r\n');

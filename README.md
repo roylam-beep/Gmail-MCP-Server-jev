@@ -56,7 +56,7 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 - Send emails with subject, content, **attachments**, and recipients
 - **Full attachment support** - send and receive file attachments
 - **Download email attachments** to local filesystem
-- **Download full emails** to files in json/eml/txt/html formats
+- **Download full emails** to files in json/eml/txt/html formats (`.eml` is written as a byte-for-byte copy of the original message, so attachments survive intact)
 - **Thread-level operations** - get full threads, list inbox threads, batch-expand threads
 - Support for HTML emails and multipart messages with both HTML and plain text versions
 - Full support for international characters in subject lines and email content
@@ -76,6 +76,8 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 - Global credential storage for convenience
 
 ## Installation & Authentication
+
+**Requires Node.js 22 or newer.** This is the version CI builds and tests against, the version the Docker image is built on, and the floor declared in `package.json`.
 
 ### Installing from npm (recommended)
 
@@ -1016,15 +1018,20 @@ The server intelligently extracts email content from complex MIME structures:
 - Prioritizes plain text content when available
 - Falls back to HTML content if plain text is not available
 - Handles multi-part MIME messages with nested parts
+- Decodes each part with the charset it declares (Big5, Shift_JIS, GBK, ISO-8859-1, …), not UTF-8 unconditionally. The `Content-Type` parameters are parsed properly rather than scanned, so a `charset` hidden inside a quoted parameter value by the sender cannot steer the decoder
+- Bounds MIME nesting at 32 levels, so a hostile or malformed message cannot overflow the call stack
 - **Processes attachments information (filename, type, size, download ID)**
+- Attachment filenames are reduced to a single safe path component before they are reported or written
 - Preserves original email headers (From, To, Subject, Date)
 
 ### International Character Support
 
 The server fully supports non-ASCII characters in email subjects and content, including:
 - Turkish, Chinese, Japanese, Korean, and other non-Latin alphabets
-- Special characters and symbols
-- Proper encoding ensures correct display in email clients
+- Special characters, symbols and emoji
+- Outgoing bodies are sent with a `Content-Transfer-Encoding` that matches the bytes: `7bit` only for text that is genuinely 7-bit clean (ASCII, no C0 controls), `base64` (wrapped at 76 characters) for anything else. Declaring `7bit` for a UTF-8 body is what produces mojibake in strict clients.
+- Subjects are encoded as RFC 2047 encoded-words, folded so every header line stays inside the 76-character encoded-word limit, and never split mid-character
+- Every header field is folded to the RFC 5322 998-character line limit, header name included — a 100-recipient `To:` runs to several thousand characters on one line otherwise
 
 ### Comprehensive Label Management
 
@@ -1047,11 +1054,34 @@ These label management features enable sophisticated organization of emails dire
 
 The server includes efficient batch processing capabilities:
 
-- Process up to 50 emails at once (configurable batch size)
+- Process up to 50 emails at once (`batchSize`, 1-100; up to 1000 message IDs per call)
 - Automatic chunking of large email sets to avoid API limits
-- Detailed success/failure reporting for each operation
-- Graceful error handling with individual retries
+- Per-message success/failure reporting: each message settles independently, so one failure never re-issues the calls that already succeeded (this used to report already-deleted messages as failures)
+- `batch_report_phishing` uses Gmail's native `batchModify` and retries a failed chunk one message at a time, which is safe because applying the SPAM label is idempotent
+- Read-heavy tools (`search_emails`, `list_inbox_threads`, `get_inbox_with_threads`) cap Gmail reads at 5 in flight, keeping large result sets inside the per-user quota instead of returning `429 rateLimitExceeded`. The first failure stops the fan-out rather than letting the rest of the batch drain in the background
+- Thread listings report `truncated: true` when the 20-page scan cap is reached with results still pending, so a capped result is distinguishable from the end of the mailbox
 - Perfect for bulk inbox management and organization tasks
+
+### Input validation
+
+Every tool argument is bounded by its schema, so a malformed call is rejected before it reaches the Gmail API:
+
+| Argument | Bound |
+| --- | --- |
+| `batchSize` | integer, 1-100 |
+| `maxResults` | integer, 1-500 |
+| `messageIds` | 1-1000 entries |
+| `to` / `cc` / `bcc` | up to 100 addresses, 320 characters each; at least one recipient across the three |
+| `addLabelIds` / `removeLabelIds` | up to 100 entries |
+| `attachments` | up to 25 file paths |
+| `inlineImages` | up to 50 images |
+| `subject` | 998 characters (RFC 5322 line limit) |
+| `query` | 2048 characters |
+| `body` / `htmlBody` | 10 MB |
+| `inlineImages[].content` | 10 MiB decoded |
+| `attachmentId` | 4096 characters (Gmail's IDs are long base64url blobs) |
+
+A cc-only or bcc-only send is valid: `to` may be empty as long as `cc` or `bcc` is not, and the `To:` header is then omitted rather than emitted empty.
 
 ## Security Notes
 
@@ -1060,6 +1090,11 @@ The server includes efficient batch processing capabilities:
 - Never share or commit your credentials to version control
 - Regularly review and revoke unused access in your Google Account settings
 - Credentials are stored globally but are only accessible by the current user
+- `credentials.json` and `gcp-oauth.keys.json` are written `0600` and the config directory `0700`. Permissions are re-applied on every start, so a file created before this (or under a permissive umask) is tightened rather than left world-readable
+- Credential writes are atomic (temp file + `fsync` + `rename`), so a crash or a token refresh racing the auth flow cannot leave a truncated `credentials.json` and lose your refresh token
+- Download paths are validated: filenames from attachments and message IDs are reduced to a single safe component and the resolved path is verified to stay inside the requested directory. Attachment filenames are chosen by the sender, so the reduction strips Unicode whitespace as well as ASCII — otherwise a name like `" .bashrc"` still lands as a dotfile
+- `auth` times out after 10 minutes rather than waiting forever, answers a second hit on the callback URL with 409 instead of racing it, and survives a host with no browser to launch
+- All server diagnostics go to stderr. stdout carries only the MCP JSON-RPC stream
 - **Attachment files are processed locally and never stored permanently by the server**
 
 ## Troubleshooting
@@ -1076,9 +1111,11 @@ The server includes efficient batch processing capabilities:
    - By default authentication uses port 3000; either free it up before running authentication, or run on a different port by passing a custom callback URL (e.g. `node dist/index.js auth http://localhost:8080/oauth2callback`)
    - If freeing port 3000, you can find and stop the process using that port
    - A custom callback URL must match one of the authorized redirect URIs registered in the Google Cloud Console
+   - `auth` reports `EADDRINUSE` and `EACCES` with the port and the fix instead of exiting on an unhandled error. A callback URL with no port defaults to 80, which needs elevated privileges — give it an explicit high port
 
 4. **Batch Operation Failures**
-   - If batch operations fail, they automatically retry individual items
+   - Per-message endpoints (`batch_modify_emails`, `batch_delete_emails`) settle each message independently; a failure is reported for that message only and its siblings are never re-issued
+   - `batch_report_phishing` uses Gmail's batch endpoint and retries a failed chunk one message at a time
    - Check the detailed error messages for specific failures
    - Consider reducing the batch size if you encounter rate limiting
 

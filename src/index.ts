@@ -23,6 +23,15 @@ import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope
 import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ForwardEmailSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 import { resolveToolPrefix } from "./tool-prefix.js";
+import { sanitizeFilename, fallbackAttachmentName, resolveWithinDirectory } from "./filename-utils.js";
+import { processItemsIndividually, processBatchesWithFallback, mapWithConcurrency } from "./batch-utils.js";
+import { extractEmailContent, extractAttachments, findAttachmentFilename, GmailMessagePart } from "./mime-utils.js";
+import { ensureSecureDirFor, hardenFilePermissions, writeSecretJsonAtomic } from "./secure-store.js";
+
+// stdout is reserved for the MCP JSON-RPC stream (StdioServerTransport).
+// Anything written there that is not a protocol frame corrupts the session for
+// the client, so every diagnostic in this file goes to stderr — console.log is
+// deliberately unused.
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -39,66 +48,10 @@ const CREDENTIALS_PATH = process.env.GMAIL_CREDENTIALS_PATH || path.join(CONFIG_
 // and exits before the server starts — run `auth` without --tool-prefix.
 const TOOL_PREFIX = resolveToolPrefix(process.argv.slice(2), process.env);
 
-// Type definitions for Gmail API responses
-interface GmailMessagePart {
-    partId?: string;
-    mimeType?: string;
-    filename?: string;
-    headers?: Array<{
-        name: string;
-        value: string;
-    }>;
-    body?: {
-        attachmentId?: string;
-        size?: number;
-        data?: string;
-    };
-    parts?: GmailMessagePart[];
-}
-
-interface EmailContent {
-    text: string;
-    html: string;
-}
-
 // OAuth2 configuration
 let oauth2Client: OAuth2Client;
 let authorizedScopes: string[] = DEFAULT_SCOPES;
 let callbackUrl: URL;
-
-/**
- * Recursively extract email body content from MIME message parts
- * Handles complex email structures with nested parts
- */
-function extractEmailContent(messagePart: GmailMessagePart): EmailContent {
-    // Initialize containers for different content types
-    let textContent = '';
-    let htmlContent = '';
-
-    // If the part has a body with data, process it based on MIME type
-    if (messagePart.body && messagePart.body.data) {
-        const content = Buffer.from(messagePart.body.data, 'base64').toString('utf8');
-
-        // Store content based on its MIME type
-        if (messagePart.mimeType === 'text/plain') {
-            textContent = content;
-        } else if (messagePart.mimeType === 'text/html') {
-            htmlContent = content;
-        }
-    }
-
-    // If the part has nested parts, recursively process them
-    if (messagePart.parts && messagePart.parts.length > 0) {
-        for (const part of messagePart.parts) {
-            const { text, html } = extractEmailContent(part);
-            if (text) textContent += text;
-            if (html) htmlContent += html;
-        }
-    }
-
-    // Return both plain text and HTML content
-    return { text: textContent, html: htmlContent };
-}
 
 /**
  * Extract common headers from Gmail message payload
@@ -118,64 +71,32 @@ function extractHeaders(payload: any): { subject: string; from: string; to: stri
     };
 }
 
-// Most filesystems cap filenames at 255 bytes. Gmail attachment IDs for larger
-// attachments can be ~500 chars, so a fallback name like `attachment-<id>`
-// would exceed that and fail with ENAMETOOLONG on write.
-const MAX_FILENAME_LENGTH = 200;
-
-function sanitizeFilename(filename: string): string {
-    let name = path.basename(filename);
-    if (Buffer.byteLength(name) <= MAX_FILENAME_LENGTH) {
-        return name;
-    }
-    const ext = path.extname(name);
-    const stem = name.slice(0, MAX_FILENAME_LENGTH - Buffer.byteLength(ext));
-    return stem + ext;
-}
-
-function fallbackAttachmentName(attachmentId: string): string {
-    return sanitizeFilename(`attachment-${attachmentId.slice(0, 16)}`);
-}
-
-/**
- * Extract attachments from Gmail message payload
- */
-function extractAttachments(payload: GmailMessagePart): EmailAttachment[] {
-    const attachments: EmailAttachment[] = [];
-
-    function processAttachmentParts(part: GmailMessagePart) {
-        if (part.body && part.body.attachmentId) {
-            attachments.push({
-                id: part.body.attachmentId,
-                filename: part.filename || `attachment-${part.body.attachmentId}`,
-                mimeType: part.mimeType || "application/octet-stream",
-                size: part.body.size || 0,
-            });
-        }
-        if (part.parts) {
-            part.parts.forEach((subpart: GmailMessagePart) => processAttachmentParts(subpart));
-        }
-    }
-
-    processAttachmentParts(payload);
-    return attachments;
-}
-
 async function loadCredentials() {
     try {
-        // Create config directory if it doesn't exist
-        if (!process.env.GMAIL_OAUTH_PATH && !process.env.GMAIL_CREDENTIALS_PATH && !fs.existsSync(CONFIG_DIR)) {
-            fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
-        }
+        // Create the directory holding each configured path. Deriving it from the
+        // paths actually in use covers the case where only one of
+        // GMAIL_OAUTH_PATH / GMAIL_CREDENTIALS_PATH is overridden — the other
+        // still points into ~/.gmail-mcp, which nobody would otherwise create.
+        ensureSecureDirFor(OAUTH_PATH);
+        ensureSecureDirFor(CREDENTIALS_PATH);
 
         // Check for OAuth keys in current directory first, then in config directory
         const localOAuthPath = path.join(process.cwd(), 'gcp-oauth.keys.json');
-        let oauthPath = OAUTH_PATH;
 
         if (fs.existsSync(localOAuthPath)) {
             // If found in current directory, copy to config directory
             fs.copyFileSync(localOAuthPath, OAUTH_PATH);
-            console.log('OAuth keys found in current directory, copied to global config.');
+            // copyFileSync carries the source file's mode over, which is
+            // whatever the user's umask produced — commonly world-readable.
+            hardenFilePermissions(OAUTH_PATH);
+            console.error('OAuth keys found in current directory, copied to global config.');
+        }
+
+        // The keys file holds client_id + client_secret. It is hardened after a
+        // copy above, but the documented placement is to drop it straight into
+        // the config directory — in which case nothing had ever tightened it.
+        if (fs.existsSync(OAUTH_PATH)) {
+            hardenFilePermissions(OAUTH_PATH);
         }
 
         if (!fs.existsSync(OAUTH_PATH)) {
@@ -205,7 +126,7 @@ async function loadCredentials() {
         // where TLS terminates at the proxy and traffic is forwarded to the local
         // listener on port 3000. Direct browser->listener https would hang.
         if (callbackUrl.protocol === 'https:') {
-            console.log('https callback URL detected: assuming a reverse proxy terminates TLS and forwards to the local listener on port 3000 (see README "Cloud Server Authentication").');
+            console.error('https callback URL detected: assuming a reverse proxy terminates TLS and forwards to the local listener on port 3000 (see README "Cloud Server Authentication").');
         }
 
         oauth2Client = new OAuth2Client(
@@ -215,6 +136,13 @@ async function loadCredentials() {
         );
 
         if (fs.existsSync(CREDENTIALS_PATH)) {
+            // Credentials written before this check (or with a permissive umask)
+            // stay world-readable, and writeFileSync's `mode` never revisits an
+            // existing file. Tighten on every start.
+            if (hardenFilePermissions(CREDENTIALS_PATH)) {
+                console.error(`Tightened permissions on ${CREDENTIALS_PATH} to 0600.`);
+            }
+
             const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
 
             // Credentials file structure (v1.2.0+):
@@ -245,7 +173,7 @@ async function loadCredentials() {
                     const updated = onDisk.tokens
                         ? { ...onDisk, tokens: mergedTokens }
                         : mergedTokens;
-                    fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(updated, null, 2), { mode: 0o600 });
+                    writeSecretJsonAtomic(CREDENTIALS_PATH, updated);
                 } catch (err) {
                     console.error('Failed to persist refreshed tokens:', err);
                 }
@@ -256,6 +184,9 @@ async function loadCredentials() {
         process.exit(1);
     }
 }
+
+/** How long `auth` waits for the browser to come back before giving up. */
+const AUTH_TIMEOUT_MS = 10 * 60 * 1000;
 
 async function authenticate(scopes: string[]) {
     const server = http.createServer();
@@ -268,24 +199,94 @@ async function authenticate(scopes: string[]) {
     const port = callbackUrl.port
         ? Number(callbackUrl.port)
         : (callbackUrl.protocol === 'https:' ? 3000 : 80);
-    server.listen(port, '127.0.0.1');
 
     // Convert shorthand scope names (e.g., "gmail.readonly") to full Google API URLs
     const scopeUrls = scopeNamesToUrls(scopes);
 
     return new Promise<void>((resolve, reject) => {
+        let settled = false;
+        let timeout: NodeJS.Timeout | undefined;
+        const finish = (error?: Error) => {
+            if (settled) return;
+            settled = true;
+            if (timeout) clearTimeout(timeout);
+            server.close();
+            if (error) reject(error); else resolve();
+        };
+
+        // Without a listener for 'error', a failed bind is an unhandled event
+        // that terminates the process with a raw stack trace. Port 80 (the
+        // default for a portless http:// callback) needs root, and a second
+        // `auth` run while the first is still waiting hits EADDRINUSE — both
+        // are ordinary situations that deserve an actionable message.
+        server.on('error', (err: NodeJS.ErrnoException) => {
+            if (err.code === 'EADDRINUSE') {
+                finish(new Error(
+                    `Port ${port} is already in use. Close the other authentication attempt, ` +
+                    `or point the callback URL at a free port.`,
+                ));
+            } else if (err.code === 'EACCES') {
+                finish(new Error(
+                    `Permission denied binding port ${port}. Ports below 1024 need elevated ` +
+                    `privileges — use a callback URL with an explicit high port, e.g. ` +
+                    `http://localhost:3000/oauth2callback.`,
+                ));
+            } else {
+                finish(err);
+            }
+        });
+
+        server.listen(port, '127.0.0.1');
+
+        // Nothing else ever settles this promise if the user closes the tab or
+        // never visits the URL, so `auth` would wait forever.
+        timeout = setTimeout(() => {
+            finish(new Error(
+                `Timed out after ${AUTH_TIMEOUT_MS / 60000} minutes waiting for the OAuth ` +
+                `callback. Re-run \`auth\` and complete the consent screen in the browser.`,
+            ));
+        }, AUTH_TIMEOUT_MS);
+        timeout.unref();
+
         const authUrl = oauth2Client.generateAuthUrl({
             access_type: 'offline',
             prompt: 'consent',
             scope: scopeUrls,
         });
 
-        console.log('Requesting scopes:', scopes.join(', '));
-        console.log('Please visit this URL to authenticate:', authUrl);
-        open(authUrl);
+        console.error('Requesting scopes:', scopes.join(', '));
+        console.error('Please visit this URL to authenticate:', authUrl);
+        // `open` rejects on a headless host with no xdg-open and on unsupported
+        // platforms. Unhandled, that rejection terminates the process under
+        // Node's default --unhandled-rejections=throw, taking the listener with
+        // it — the exact crash class the 'error' handler above exists to stop.
+        // The URL is already on stderr, so failing to launch a browser is
+        // recoverable by hand.
+        Promise.resolve(open(authUrl)).catch((err) => {
+            console.error(
+                'Could not open a browser automatically — open the URL above manually.',
+                err instanceof Error ? err.message : err,
+            );
+        });
 
         server.on('request', async (req, res) => {
-            if (!req.url?.startsWith(callbackUrl.pathname)) return;
+            // The authorization code is single-use. Two concurrent hits on the
+            // callback both reach getToken(); the loser gets invalid_grant and,
+            // if its rejection lands first, auth reports failure even though the
+            // winner saved valid credentials.
+            if (settled) {
+                res.writeHead(409);
+                res.end('This authentication attempt has already been handled.');
+                return;
+            }
+
+            if (!req.url?.startsWith(callbackUrl.pathname)) {
+                // Answer rather than drop it: the browser's favicon request on
+                // the success page would otherwise hang until socket timeout.
+                res.writeHead(404);
+                res.end('Not found');
+                return;
+            }
 
             const url = new URL(req.url, callbackUrl.origin);
             const code = url.searchParams.get('code');
@@ -293,7 +294,7 @@ async function authenticate(scopes: string[]) {
             if (!code) {
                 res.writeHead(400);
                 res.end('No code provided');
-                reject(new Error('No code provided'));
+                finish(new Error('No code provided'));
                 return;
             }
 
@@ -303,17 +304,18 @@ async function authenticate(scopes: string[]) {
 
                 // Store both tokens and authorized scopes for runtime filtering
                 const credentials = { tokens, scopes };
-                fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(credentials, null, 2), { mode: 0o600 });
+                writeSecretJsonAtomic(CREDENTIALS_PATH, credentials);
 
                 res.writeHead(200);
                 res.end('Authentication successful! You can close this window.');
-                console.log('Credentials saved with scopes:', scopes.join(', '));
-                server.close();
-                resolve();
+                console.error('Credentials saved with scopes:', scopes.join(', '));
+                finish();
             } catch (error) {
                 res.writeHead(500);
                 res.end('Authentication failed');
-                reject(error);
+                // The listener used to stay open on this path, so a failed
+                // token exchange left the process hanging with no way out.
+                finish(error instanceof Error ? error : new Error(String(error)));
             }
         });
     });
@@ -342,15 +344,20 @@ async function main() {
                 process.exit(1);
             }
         } else {
-            console.log('No --scopes flag specified, using defaults:', DEFAULT_SCOPES.join(', '));
-            console.log('Tip: Use --scopes=gmail.readonly for read-only access');
-            console.log('Available scopes:', getAvailableScopeNames().join(', '));
+            console.error('No --scopes flag specified, using defaults:', DEFAULT_SCOPES.join(', '));
+            console.error('Tip: Use --scopes=gmail.readonly for read-only access');
+            console.error('Available scopes:', getAvailableScopeNames().join(', '));
         }
 
         await authenticate(scopes);
-        console.log('Authentication completed successfully');
+        console.error('Authentication completed successfully');
         process.exit(0);
     }
+
+    // Gmail's per-user quota is 250 units/second and messages.get costs 5, so
+    // an unbounded Promise.all over a 500-result page is answered with 429
+    // rateLimitExceeded. Cap how many reads are in flight at once.
+    const GMAIL_READ_CONCURRENCY = 5;
 
     // Initialize Gmail API
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
@@ -363,12 +370,18 @@ async function main() {
         gmailClient: typeof gmail,
         query: string,
         maxResults: number,
-    ): Promise<string[]> {
+    ): Promise<{ threadIds: string[]; truncated: boolean }> {
         const threadIds: string[] = [];
         const seen = new Set<string>();
         let pageToken: string | undefined;
+        // A query whose hits are concentrated in a few long threads yields
+        // almost no new thread IDs per page, so the loop would walk the whole
+        // mailbox looking for maxResults distinct threads. Cap the walk.
+        const MAX_PAGES = 20;
+        let pages = 0;
 
-        while (threadIds.length < maxResults) {
+        while (threadIds.length < maxResults && pages < MAX_PAGES) {
+            pages += 1;
             const response = await gmailClient.users.messages.list({
                 userId: 'me',
                 q: query,
@@ -389,7 +402,11 @@ async function main() {
             if (!pageToken) break;
         }
 
-        return threadIds;
+        // Hitting the page cap with results still pending looks identical to
+        // reaching the end of the mailbox unless it is reported, and the caller
+        // has no cursor to ask for the rest.
+        const truncated = threadIds.length < maxResults && pages >= MAX_PAGES && Boolean(pageToken);
+        return { threadIds, truncated };
     }
 
     // Server implementation
@@ -607,36 +624,6 @@ async function main() {
             }
         }
 
-        // Helper function to process operations in batches
-        async function processBatches<T, U>(
-            items: T[],
-            batchSize: number,
-            processFn: (batch: T[]) => Promise<U[]>
-        ): Promise<{ successes: U[], failures: { item: T, error: Error }[] }> {
-            const successes: U[] = [];
-            const failures: { item: T, error: Error }[] = [];
-            
-            // Process in batches
-            for (let i = 0; i < items.length; i += batchSize) {
-                const batch = items.slice(i, i + batchSize);
-                try {
-                    const results = await processFn(batch);
-                    successes.push(...results);
-                } catch (error) {
-                    // If batch fails, try individual items
-                    for (const item of batch) {
-                        try {
-                            const result = await processFn([item]);
-                            successes.push(...result);
-                        } catch (itemError) {
-                            failures.push({ item, error: itemError as Error });
-                        }
-                    }
-                }
-            }
-            
-            return { successes, failures };
-        }
 
         try {
             switch (name) {
@@ -689,8 +676,10 @@ async function main() {
                     });
 
                     const messages = response.data.messages || [];
-                    const results = await Promise.all(
-                        messages.map(async (msg) => {
+                    const results = await mapWithConcurrency(
+                        messages,
+                        GMAIL_READ_CONCURRENCY,
+                        async (msg) => {
                             const detail = await gmail.users.messages.get({
                                 userId: 'me',
                                 id: msg.id!,
@@ -704,7 +693,7 @@ async function main() {
                                 from: headers.find(h => h.name === 'From')?.value || '',
                                 date: headers.find(h => h.name === 'Date')?.value || '',
                             };
-                        })
+                        },
                     );
 
                     return {
@@ -739,7 +728,14 @@ async function main() {
                         const { subject, from, date } = extractHeaders(fullResponse.data.payload);
                         const attachments = extractAttachments(fullResponse.data.payload as GmailMessagePart);
 
-                        let content: string;
+                        // A .eml is a byte-for-byte copy of the original
+                        // RFC822 message, so it stays a Buffer. Decoding it to a
+                        // UTF-8 string and re-encoding replaced every byte that
+                        // is not valid UTF-8 — 8-bit attachment payloads,
+                        // Latin-1 headers — with U+FFFD, producing a corrupt
+                        // .eml whose attachments no longer open. Text formats
+                        // are genuine strings and keep the utf-8 write.
+                        let content: string | Buffer;
 
                         if (format === "eml") {
                             // For EML format, fetch raw RFC822 message
@@ -748,7 +744,7 @@ async function main() {
                                 id: messageId,
                                 format: "raw",
                             });
-                            content = Buffer.from(rawResponse.data.raw || "", "base64url").toString("utf-8");
+                            content = Buffer.from(rawResponse.data.raw || "", "base64url");
                         } else {
                             // Extract email content for json/txt/html
                             const emailContent = extractEmailContent(fullResponse.data.payload as GmailMessagePart || {});
@@ -764,10 +760,17 @@ async function main() {
                             }
                         }
 
-                        // Write file
-                        const filename = `${messageId}.${format}`;
-                        const fullPath = path.join(savePath, filename);
-                        fs.writeFileSync(fullPath, content, "utf-8");
+                        // Write file. messageId is caller-supplied, so it is
+                        // reduced to a single safe path component before it
+                        // becomes a filename, and the join is verified to stay
+                        // inside savePath.
+                        const filename = sanitizeFilename(`${messageId}.${format}`);
+                        const fullPath = resolveWithinDirectory(savePath, filename);
+                        if (Buffer.isBuffer(content)) {
+                            fs.writeFileSync(fullPath, content);
+                        } else {
+                            fs.writeFileSync(fullPath, content, "utf-8");
+                        }
                         const stats = fs.statSync(fullPath);
 
                         // Return metadata with attachments
@@ -957,23 +960,17 @@ async function main() {
                         requestBody.removeLabelIds = validatedArgs.removeLabelIds;
                     }
 
-                    // Process messages in batches
-                    const { successes, failures } = await processBatches(
+                    // messages.modify is a per-message endpoint, so each message
+                    // settles on its own: one failure no longer replays its
+                    // siblings (which re-issued calls that had already succeeded).
+                    const { successes, failures } = await processItemsIndividually(
                         messageIds,
                         batchSize,
-                        async (batch) => {
-                            const results = await Promise.all(
-                                batch.map(async (messageId) => {
-                                    const result = await gmail.users.messages.modify({
-                                        userId: 'me',
-                                        id: messageId,
-                                        requestBody: requestBody,
-                                    });
-                                    return { messageId, success: true };
-                                })
-                            );
-                            return results;
-                        }
+                        (messageId) => gmail.users.messages.modify({
+                            userId: 'me',
+                            id: messageId,
+                            requestBody: requestBody,
+                        }),
                     );
 
                     // Generate summary of the operation
@@ -1025,20 +1022,20 @@ async function main() {
                     const messageIds = validatedArgs.messageIds;
                     const batchSize = validatedArgs.batchSize || 50;
 
-                    const { successes, failures } = await processBatches(
+                    // batchModify is a true batch endpoint: a rejection says
+                    // nothing about individual messages, so a failed chunk is
+                    // retried one message at a time. Adding the SPAM label is
+                    // idempotent, so the retry is safe.
+                    const { successes, failures } = await processBatchesWithFallback(
                         messageIds,
                         batchSize,
-                        async (batch) => {
-                            await gmail.users.messages.batchModify({
-                                userId: 'me',
-                                requestBody: {
-                                    ids: batch,
-                                    addLabelIds: ['SPAM'],
-                                },
-                            });
-
-                            return batch.map((messageId) => ({ messageId, success: true }));
-                        }
+                        (batch) => gmail.users.messages.batchModify({
+                            userId: 'me',
+                            requestBody: {
+                                ids: batch,
+                                addLabelIds: ['SPAM'],
+                            },
+                        }),
                     );
 
                     const successCount = successes.length;
@@ -1070,22 +1067,17 @@ async function main() {
                     const messageIds = validatedArgs.messageIds;
                     const batchSize = validatedArgs.batchSize || 50;
 
-                    // Process messages in batches
-                    const { successes, failures } = await processBatches(
+                    // Deletion is permanent and NOT idempotent: the old
+                    // whole-batch retry re-deleted messages that had already
+                    // succeeded, got a 404, and reported them as failures.
+                    // Each message settles on its own instead.
+                    const { successes, failures } = await processItemsIndividually(
                         messageIds,
                         batchSize,
-                        async (batch) => {
-                            const results = await Promise.all(
-                                batch.map(async (messageId) => {
-                                    await gmail.users.messages.delete({
-                                        userId: 'me',
-                                        id: messageId,
-                                    });
-                                    return { messageId, success: true };
-                                })
-                            );
-                            return results;
-                        }
+                        (messageId) => gmail.users.messages.delete({
+                            userId: 'me',
+                            id: messageId,
+                        }),
                     );
 
                     // Generate summary of the operation
@@ -1365,21 +1357,10 @@ async function main() {
                                 format: 'full',
                             });
 
-                            // Find the attachment part to get original filename
-                            const findAttachment = (part: any): string | null => {
-                                if (part.body && part.body.attachmentId === validatedArgs.attachmentId) {
-                                    return part.filename || fallbackAttachmentName(validatedArgs.attachmentId);
-                                }
-                                if (part.parts) {
-                                    for (const subpart of part.parts) {
-                                        const found = findAttachment(subpart);
-                                        if (found) return found;
-                                    }
-                                }
-                                return null;
-                            };
-
-                            filename = findAttachment(messageResponse.data.payload) || fallbackAttachmentName(validatedArgs.attachmentId);
+                            filename = findAttachmentFilename(
+                                messageResponse.data.payload as GmailMessagePart,
+                                validatedArgs.attachmentId,
+                            ) || fallbackAttachmentName(validatedArgs.attachmentId);
                         }
 
                         // Sanitize filename to prevent path traversal
@@ -1390,12 +1371,8 @@ async function main() {
                             fs.mkdirSync(savePath, { recursive: true });
                         }
 
-                        // Resolve and validate final path stays within savePath
-                        const resolvedSavePath = path.resolve(savePath);
-                        const fullPath = path.resolve(resolvedSavePath, filename);
-                        if (!fullPath.startsWith(resolvedSavePath + path.sep) && fullPath !== resolvedSavePath) {
-                            throw new Error('Invalid filename: path traversal detected');
-                        }
+                        // Resolve and validate the final path stays within savePath
+                        const fullPath = resolveWithinDirectory(savePath, filename);
                         fs.writeFileSync(fullPath, buffer);
 
                         return {
@@ -1446,24 +1423,9 @@ async function main() {
                         }
 
                         // Extract attachment metadata
-                        const attachments: EmailAttachment[] = [];
-                        const processAttachmentParts = (part: GmailMessagePart) => {
-                            if (part.body && part.body.attachmentId) {
-                                const filename = part.filename || `attachment-${part.body.attachmentId}`;
-                                attachments.push({
-                                    id: part.body.attachmentId,
-                                    filename: filename,
-                                    mimeType: part.mimeType || 'application/octet-stream',
-                                    size: part.body.size || 0,
-                                });
-                            }
-                            if (part.parts) {
-                                part.parts.forEach((subpart: GmailMessagePart) => processAttachmentParts(subpart));
-                            }
-                        };
-                        if (msg.payload) {
-                            processAttachmentParts(msg.payload as GmailMessagePart);
-                        }
+                        const attachments: EmailAttachment[] = msg.payload
+                            ? extractAttachments(msg.payload as GmailMessagePart)
+                            : [];
 
                         return {
                             messageId: msg.id || '',
@@ -1504,7 +1466,7 @@ async function main() {
                     // query silently drops threads that contain messages sent by the
                     // user (e.g. any thread you replied to), so we search messages
                     // instead and group them by thread.
-                    const threadIds = await resolveThreadIdsFromQuery(
+                    const { threadIds, truncated } = await resolveThreadIdsFromQuery(
                         gmail,
                         validatedArgs.query || 'in:inbox',
                         validatedArgs.maxResults || 50,
@@ -1513,8 +1475,10 @@ async function main() {
                     const threads = threadIds.map(id => ({ id, snippet: '', historyId: '' }));
 
                     // Fetch metadata for each thread to get message count and latest message info
-                    const threadDetails = await Promise.all(
-                        threads.map(async (thread) => {
+                    const threadDetails = await mapWithConcurrency(
+                        threads,
+                        GMAIL_READ_CONCURRENCY,
+                        async (thread) => {
                             const detail = await gmail.users.threads.get({
                                 userId: 'me',
                                 id: thread.id!,
@@ -1537,7 +1501,7 @@ async function main() {
                                     date: latestHeaders.find(h => h.name === 'Date')?.value || '',
                                 },
                             };
-                        })
+                        },
                     );
 
                     return {
@@ -1546,6 +1510,7 @@ async function main() {
                                 type: "text",
                                 text: JSON.stringify({
                                     resultCount: threadDetails.length,
+                                    truncated,
                                     threads: threadDetails,
                                 }, null, 2),
                             },
@@ -1556,7 +1521,7 @@ async function main() {
                 case "get_inbox_with_threads": {
                     const validatedArgs = GetInboxWithThreadsSchema.parse(args);
                     // Same threads.list quirk as list_inbox_threads: resolve via messages.list.
-                    const threadIds = await resolveThreadIdsFromQuery(
+                    const { threadIds, truncated } = await resolveThreadIdsFromQuery(
                         gmail,
                         validatedArgs.query || 'in:inbox',
                         validatedArgs.maxResults || 50,
@@ -1566,8 +1531,10 @@ async function main() {
 
                     if (!validatedArgs.expandThreads) {
                         // Return basic thread list without expansion (same as list_inbox_threads)
-                        const threadSummaries = await Promise.all(
-                            threads.map(async (thread) => {
+                        const threadSummaries = await mapWithConcurrency(
+                            threads,
+                            GMAIL_READ_CONCURRENCY,
+                            async (thread) => {
                                 const detail = await gmail.users.threads.get({
                                     userId: 'me',
                                     id: thread.id!,
@@ -1590,7 +1557,7 @@ async function main() {
                                         date: latestHeaders.find(h => h.name === 'Date')?.value || '',
                                     },
                                 };
-                            })
+                            },
                         );
 
                         return {
@@ -1599,6 +1566,7 @@ async function main() {
                                     type: "text",
                                     text: JSON.stringify({
                                         resultCount: threadSummaries.length,
+                                        truncated,
                                         threads: threadSummaries,
                                     }, null, 2),
                                 },
@@ -1607,8 +1575,10 @@ async function main() {
                     }
 
                     // Expand each thread with full message content (parallel fetch)
-                    const expandedThreads = await Promise.all(
-                        threads.map(async (thread) => {
+                    const expandedThreads = await mapWithConcurrency(
+                        threads,
+                        GMAIL_READ_CONCURRENCY,
+                        async (thread) => {
                             const threadDetail = await gmail.users.threads.get({
                                 userId: 'me',
                                 id: thread.id!,
@@ -1630,24 +1600,9 @@ async function main() {
                                 const body = text || html || '';
 
                                 // Extract attachment metadata
-                                const attachments: EmailAttachment[] = [];
-                                const processAttachmentParts = (part: GmailMessagePart) => {
-                                    if (part.body && part.body.attachmentId) {
-                                        const filename = part.filename || `attachment-${part.body.attachmentId}`;
-                                        attachments.push({
-                                            id: part.body.attachmentId,
-                                            filename: filename,
-                                            mimeType: part.mimeType || 'application/octet-stream',
-                                            size: part.body.size || 0,
-                                        });
-                                    }
-                                    if (part.parts) {
-                                        part.parts.forEach((subpart: GmailMessagePart) => processAttachmentParts(subpart));
-                                    }
-                                };
-                                if (msg.payload) {
-                                    processAttachmentParts(msg.payload as GmailMessagePart);
-                                }
+                                const attachments: EmailAttachment[] = msg.payload
+                                    ? extractAttachments(msg.payload as GmailMessagePart)
+                                    : [];
 
                                 return {
                                     messageId: msg.id || '',
@@ -1673,7 +1628,7 @@ async function main() {
                                 messageCount: messages.length,
                                 messages,
                             };
-                        })
+                        },
                     );
 
                     return {
@@ -1682,6 +1637,7 @@ async function main() {
                                 type: "text",
                                 text: JSON.stringify({
                                     resultCount: expandedThreads.length,
+                                    truncated,
                                     threads: expandedThreads,
                                 }, null, 2),
                             },
