@@ -31,12 +31,16 @@ MISMATCH handling: don't build it, don't merge it. **Pitch the item to the maint
 
 ## npm & MCP Registry Releases
 
-Published as **@artymclabin/gmail-mcp** on npm + **io.github.ArtyMcLabin/Gmail-MCP-Server** on the official MCP Registry.
+Published as **@geniushub/gmail-mcp** on npm + **io.github.roylam-beep/Gmail-MCP-Server-jev** on the official MCP Registry.
+
+🚨 **This is a fork of `ArtyMcLabin/Gmail-MCP-Server`, which is itself a fork of `GongRzhe/Gmail-MCP-Server`.** Until 1.3.0 the release workflow still pointed at the upstream author's identities — `@artymclabin/gmail-mcp` on npm (maintainer `artymclabin`, not us), the `io.github.ArtyMcLabin/*` registry namespace, and `rawceo/gmail-mcp` on Smithery. A tag push from here would have attempted to publish under someone else's names; npm and the registry would have refused it on OIDC, and Smithery would not have. Everything now names this repo. If any of these ever read `ArtyMcLabin` again, do not tag — fix the identity first.
 
 - **Tags are cut from `main` ONLY.** Pushing a `v*` tag triggers `.github/workflows/publish.yml` -> npm publish. Never tag `experimental` (incident 2026-07-11: v1.2.0/v1.2.1 tagged off experimental put unsoaked staging code on npm as `latest`; resolved by same-day promotion).
-- **Release procedure (at promotion):** merge `experimental`->`main` -> bump version in package.json + package-lock.json + server.json (both `version` fields) -> commit on main -> `git tag vX.Y.Z && git push origin vX.Y.Z` -> verify the "Publish release" workflow is green. The tag push publishes EVERYWHERE automatically: npm -> official MCP Registry (OIDC, no interactive login) -> Smithery (.mcpb bundle built in CI from `mcpb-manifest.json`, version-synced via jq). No manual `mcp-publisher` or `smithery` steps needed. First automated exercise: next release after 2026-07-11 - watch it end-to-end once.
-- `mcpName` in package.json must always equal `name` in server.json (registry ownership validation).
-- **NPM_TOKEN secret** rotation is tracked in the maintainer's PRIVATE task tracker (Personal CRM) - 🚨 NEVER document token/auth posture details (expiry dates, 2FA state, token types) in this public repo, including GitHub issues (incident 2026-07-11: such an issue was created and had to be deleted - supply-chain recon risk).
+- **Release procedure (at promotion):** merge `experimental`->`main` -> bump version in package.json + package-lock.json + server.json (both `version` fields) + mcpb-manifest.json -> commit on main -> verify CI is green on main -> `git tag vX.Y.Z && git push origin vX.Y.Z` -> verify the "Publish release" workflow is green. The tag push publishes npm -> official MCP Registry (both OIDC, no stored secrets, no interactive login). No manual `mcp-publisher` step needed.
+- **Version lives in four files.** package.json, package-lock.json (two fields — use `npm version X.Y.Z --no-git-tag-version`), server.json (two fields: top-level and `packages[0].version`) and mcpb-manifest.json. The last one used to be synced by CI's jq step and drifted to 1.2.2 while the package was at 1.2.3; nothing syncs it now, so bump it by hand. `src/node-version.test.ts` reads it, so it cannot simply be deleted.
+- `mcpName` in package.json must always equal `name` in server.json (registry ownership validation), and `server.json`'s `packages[0].identifier` must equal package.json's `name`.
+- **npm publishes over OIDC, not a token.** The trust is registered on npmjs.com against repo `roylam-beep/Gmail-MCP-Server-jev` and the exact filename `publish.yml`. Renaming or moving that file makes npm refuse the run. There is no NPM_TOKEN secret to rotate. 🚨 NEVER document token/auth posture details (expiry dates, 2FA state, token types) in this public repo, including GitHub issues (incident 2026-07-11: such an issue was created and had to be deleted - supply-chain recon risk).
+- **Smithery publishing was removed at 1.3.0** — it was hardcoded to the upstream namespace `rawceo/gmail-mcp` and needed a stored `SMITHERY_API_KEY`. `mcpb-manifest.json` is kept for a manual `.mcpb` build; nothing in CI builds it.
 
 ## PR Review Checklist (All Steps Mandatory)
 

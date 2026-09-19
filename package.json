@@ -1,8 +1,8 @@
 {
-  "name": "@artymclabin/gmail-mcp",
+  "name": "@geniushub/gmail-mcp",
   "version": "1.3.0",
-  "mcpName": "io.github.ArtyMcLabin/Gmail-MCP-Server",
-  "description": "Lean Gmail MCP server with auto authentication support (maintained fork of GongRzhe/Gmail-MCP-Server)",
+  "mcpName": "io.github.roylam-beep/Gmail-MCP-Server-jev",
+  "description": "Lean Gmail MCP server with auto authentication support (maintained fork of ArtyMcLabin/Gmail-MCP-Server)",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -35,19 +35,20 @@
     "claude",
     "auto-auth"
   ],
-  "author": "Arty McLabin",
+  "author": "roylam-beep",
   "contributors": [
+    "Arty McLabin (upstream fork author)",
     "gongrzhe (original upstream author)"
   ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ArtyMcLabin/Gmail-MCP-Server.git"
+    "url": "git+https://github.com/roylam-beep/Gmail-MCP-Server-jev.git"
   },
   "bugs": {
-    "url": "https://github.com/ArtyMcLabin/Gmail-MCP-Server/issues"
+    "url": "https://github.com/roylam-beep/Gmail-MCP-Server-jev/issues"
   },
-  "homepage": "https://github.com/ArtyMcLabin/Gmail-MCP-Server#readme",
+  "homepage": "https://github.com/roylam-beep/Gmail-MCP-Server-jev#readme",
   "publishConfig": {
     "access": "public"
   },

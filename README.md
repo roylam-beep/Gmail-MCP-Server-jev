@@ -2,11 +2,11 @@
 
 # Gmail MCP Server (Actively Maintained Fork)
 
-**Installation:** `npx @artymclabin/gmail-mcp auth` - or just tell your Claude to install the MCP from this repo (`https://github.com/ArtyMcLabin/Gmail-MCP-Server`) and let it set up. Prefer manual steps? See [Installation & Authentication](#installation--authentication).
+**Installation:** `npx @geniushub/gmail-mcp auth` - or just tell your Claude to install the MCP from this repo (`https://github.com/roylam-beep/Gmail-MCP-Server-jev`) and let it set up. Prefer manual steps? See [Installation & Authentication](#installation--authentication).
 
-[![CI](https://github.com/ArtyMcLabin/Gmail-MCP-Server/actions/workflows/ci.yml/badge.svg)](https://github.com/ArtyMcLabin/Gmail-MCP-Server/actions/workflows/ci.yml) [![npm](https://img.shields.io/npm/v/@artymclabin/gmail-mcp)](https://www.npmjs.com/package/@artymclabin/gmail-mcp)
+[![CI](https://github.com/roylam-beep/Gmail-MCP-Server-jev/actions/workflows/ci.yml/badge.svg)](https://github.com/roylam-beep/Gmail-MCP-Server-jev/actions/workflows/ci.yml) [![npm](https://img.shields.io/npm/v/@geniushub/gmail-mcp)](https://www.npmjs.com/package/@geniushub/gmail-mcp)
 
-Also on the [official MCP Registry](https://registry.modelcontextprotocol.io) (`io.github.ArtyMcLabin/Gmail-MCP-Server`) and [Smithery](https://smithery.ai/servers/rawceo/gmail-mcp).
+Also on the [official MCP Registry](https://registry.modelcontextprotocol.io) (`io.github.roylam-beep/Gmail-MCP-Server-jev`).
 
 > **This is an actively maintained fork of [GongRzhe/Gmail-MCP-Server](https://github.com/GongRzhe/Gmail-MCP-Server).**
 >
@@ -42,7 +42,7 @@ There's a downstream fork that took this in the **maximalist** direction. I'm no
 
 All features are production-tested in daily use.
 
-[![Star History Chart](https://api.star-history.com/svg?repos=ArtyMcLabin/Gmail-MCP-Server&type=Date)](https://star-history.com/#ArtyMcLabin/Gmail-MCP-Server&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=roylam-beep/Gmail-MCP-Server-jev&type=Date)](https://star-history.com/#roylam-beep/Gmail-MCP-Server-jev&Date)
 
 ---
 
@@ -82,19 +82,19 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 ### Installing from npm (recommended)
 
 ```bash
-npx @artymclabin/gmail-mcp auth
+npx @geniushub/gmail-mcp auth
 ```
 
 ### Installing from source
 
 ```bash
-git clone https://github.com/ArtyMcLabin/Gmail-MCP-Server.git
-cd Gmail-MCP-Server
+git clone https://github.com/roylam-beep/Gmail-MCP-Server-jev.git
+cd Gmail-MCP-Server-jev
 npm install
 npm run build
 ```
 
-> **Note**: The `npx @gongrzhe/server-gmail-autoauth-mcp` commands found in older docs reference the [unmaintained upstream fork](https://github.com/GongRzhe/Gmail-MCP-Server). This fork is published as [`@artymclabin/gmail-mcp`](https://www.npmjs.com/package/@artymclabin/gmail-mcp).
+> **Note**: Older docs reference `npx @gongrzhe/server-gmail-autoauth-mcp` ([original, unmaintained](https://github.com/GongRzhe/Gmail-MCP-Server)) or `npx @artymclabin/gmail-mcp` ([the fork this one is built on](https://github.com/ArtyMcLabin/Gmail-MCP-Server)). This fork is published as [`@geniushub/gmail-mcp`](https://www.npmjs.com/package/@geniushub/gmail-mcp).
 
 ### Setting up Google Cloud credentials
 
@@ -1160,4 +1160,4 @@ MIT
 
 ## Support
 
-If you encounter any issues or have questions, please [file an issue](https://github.com/ArtyMcLabin/Gmail-MCP-Server/issues).
+If you encounter any issues or have questions, please [file an issue](https://github.com/roylam-beep/Gmail-MCP-Server-jev/issues).

@@ -33,7 +33,7 @@ This guide will help you install and configure the Gmail AutoAuth MCP server for
 
 3. Run authentication:
    ```bash
-   npx @artymclabin/gmail-mcp auth
+   npx @geniushub/gmail-mcp auth
    ```
    This will:
    - Look for gcp-oauth.keys.json in current directory or ~/.gmail-mcp/
@@ -43,7 +43,7 @@ This guide will help you install and configure the Gmail AutoAuth MCP server for
 
    By default the local OAuth server listens on port 3000 at /oauth2callback. To use a different port or path (for example if port 3000 is unavailable), pass a full callback URL; the listener binds to the port and path from that URL:
    ```bash
-   npx @artymclabin/gmail-mcp auth http://localhost:8080/oauth2callback
+   npx @geniushub/gmail-mcp auth http://localhost:8080/oauth2callback
    ```
    The URL must exactly match one of the authorized redirect URIs registered in the Google Cloud Console.
 
@@ -54,7 +54,7 @@ This guide will help you install and configure the Gmail AutoAuth MCP server for
        "gmail": {
          "command": "npx",
          "args": [
-           "@artymclabin/gmail-mcp"
+           "@geniushub/gmail-mcp"
          ]
        }
      }
