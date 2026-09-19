@@ -52,15 +52,16 @@ jobs:
             DIFF_RANGE="$BEFORE_SHA..HEAD"
           fi
 
-          # Only require README update if source code was modified
-          SRC_CHANGED=$(git diff --name-only $DIFF_RANGE | grep -c '^src/' || true)
+          # Only require a README update if shipped source changed. Tests live
+          # under src/ too, and a test-only change has nothing user-facing to
+          # document — demanding one just trains people to write [skip-readme].
+          SRC_FILES=$(git diff --name-only $DIFF_RANGE | grep '^src/' | grep -vE '\.test\.[cm]?ts$' || true)
+          SRC_CHANGED=$(printf '%s' "$SRC_FILES" | grep -c . || true)
           if [ "$SRC_CHANGED" -eq 0 ]; then
-            echo "No source code changes — README check skipped."
+            echo "No shipped source changes — README check skipped."
             exit 0
           fi
 
-          # Capture changed source files for the issue body
-          SRC_FILES=$(git diff --name-only $DIFF_RANGE | grep '^src/' || true)
           echo "src_files<<EOF" >> "$GITHUB_OUTPUT"
           echo "$SRC_FILES" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
@@ -81,9 +82,11 @@ jobs:
         run: |
           DIFF_RANGE="origin/${{ github.base_ref }}...HEAD"
 
-          SRC_CHANGED=$(git diff --name-only $DIFF_RANGE | grep -c '^src/' || true)
+          # Same rule as the push check: tests under src/ do not owe a README.
+          SRC_FILES=$(git diff --name-only $DIFF_RANGE | grep '^src/' | grep -vE '\.test\.[cm]?ts$' || true)
+          SRC_CHANGED=$(printf '%s' "$SRC_FILES" | grep -c . || true)
           if [ "$SRC_CHANGED" -eq 0 ]; then
-            echo "No source code changes — README check skipped."
+            echo "No shipped source changes — README check skipped."
             exit 0
           fi
 
@@ -104,6 +107,7 @@ jobs:
         if: failure() && steps.push_check.outputs.failed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO_FULL: ${{ github.repository }}
         run: |
           COMMIT_SHA="${{ github.sha }}"
           SHORT_SHA="${COMMIT_SHA:0:7}"
@@ -111,6 +115,16 @@ jobs:
           COMMIT_MSG=$(git log -1 --format=%s)
           SRC_FILES="${{ steps.push_check.outputs.src_files }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # This step only runs when the README check has ALREADY failed the
+          # job, so it exists to notify, not to judge. On a repository with
+          # issues disabled every gh call below fails and the log ends on
+          # "repository has disabled issues" — which reads like the cause and
+          # buries the actual one.
+          if ! gh issue list --repo "$REPO_FULL" --limit 1 >/dev/null 2>&1; then
+            echo "::notice::Issues are disabled here — skipping the README-gap issue. The README check itself is what failed."
+            exit 0
+          fi
 
           # Ensure readme-gap label exists
           gh label create "readme-gap" --repo "${{ github.repository }}" \
