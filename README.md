@@ -77,6 +77,29 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 
 ## Installation & Authentication
 
+### Quick start
+
+```bash
+git clone https://github.com/roylam-beep/Gmail-MCP-Server-jev.git
+cd Gmail-MCP-Server-jev && npm install
+npm run setup
+```
+
+`npm run setup` builds, finds your OAuth client wherever it landed (including
+an unrenamed `client_secret_*.json` in Downloads), tells you what is wrong
+with it if it is the wrong kind of file, runs the sign-in, and prints the
+client config to paste. `npm run setup -- --check` reports the state without
+opening a browser.
+
+You still have to create the OAuth client once, in the Google Cloud console —
+`npm run setup` links each step. Gmail scopes are
+[restricted](https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification),
+so a shared, pre-registered client would need a CASA security assessment and
+annual recertification; that is why even Google's own Gmail MCP server asks
+you to bring your own. If you already have a Google Cloud project for
+something else, reuse it — only "enable the Gmail API" and "create the
+credential" apply.
+
 **Requires Node.js 22 or newer.** This is the version CI builds and tests against, the version the Docker image is built on, and the floor declared in `package.json`.
 
 ### Installing from npm (recommended)
