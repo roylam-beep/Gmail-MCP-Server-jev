@@ -302,6 +302,82 @@ export const ForwardEmailSchema = z.object({
   includeAttachments: z.boolean().optional().default(true).describe("Carry the original message's attachments and inline images over to the forwarded copy"),
 }).refine(hasAnyRecipient, RECIPIENT_REQUIRED);
 
+// Triage (rule-based mail sorting) schemas
+// ----------------------------------------
+// Gmail's own filters only apply to incoming mail. These rules are the
+// retroactive half: the same kind of condition, matched locally against
+// messages a query already selected. Header-only — no body is ever fetched.
+const MAX_TRIAGE_MESSAGES = 500;
+const MAX_TRIAGE_RULES = 200;
+const MAX_CONDITION_VALUES = 50;
+const MAX_RUN_ID_LENGTH = 128;
+
+const conditionValueArray = () => z.array(z.string().min(1).max(MAX_EMAIL_LENGTH)).max(MAX_CONDITION_VALUES);
+const triageLabelArray = () => z.array(labelNameString()).max(MAX_LABEL_IDS);
+const runIdString = () => z.string().min(1).max(MAX_RUN_ID_LENGTH).regex(
+  /^[A-Za-z0-9._-]+$/,
+  "run id may contain only letters, digits, dot, underscore and hyphen",
+);
+
+export const TriageConditionsSchema = z.object({
+  fromEquals: conditionValueArray().optional().describe("Exact sender addresses, case-insensitive"),
+  fromDomain: conditionValueArray().optional().describe("Sender domains; matches the domain and any subdomain of it"),
+  fromContains: conditionValueArray().optional().describe("Substrings of the sender display name or address"),
+  subjectContains: conditionValueArray().optional().describe("Substrings of the subject, case-insensitive"),
+  listIdContains: conditionValueArray().optional().describe("Substrings of the List-Id header — the reliable way to catch one mailing list"),
+  hasListUnsubscribe: z.boolean().optional().describe("true matches bulk mail carrying List-Unsubscribe; false matches mail without it"),
+  hasLabel: conditionValueArray().optional().describe("Label names the message already carries (any of)"),
+  lacksLabel: conditionValueArray().optional().describe("Label names the message must NOT carry (all of) — use it to keep a rule from re-running"),
+});
+
+export const TriageActionsSchema = z.object({
+  addLabels: triageLabelArray().describe("Label NAMES to apply; created on demand when the plan is applied"),
+  removeLabels: triageLabelArray().optional().describe("Label names to remove"),
+  archive: z.boolean().optional().describe("Remove the INBOX label"),
+  markRead: z.boolean().optional().describe("Remove the UNREAD label"),
+});
+
+export const TriageRuleSchema = z.object({
+  name: z.string().min(1).max(MAX_FILENAME_LENGTH).describe("Unique rule name, recorded against every message it claims"),
+  when: TriageConditionsSchema.describe("Conditions; values within a field are OR'd, fields are AND'd. A rule with no conditions never matches."),
+  actions: TriageActionsSchema.describe("Label changes to apply. Deleting, sending and forwarding are intentionally not expressible."),
+});
+
+export const TriagePlanSchema = z.object({
+  query: queryString().optional().default("in:inbox").describe("Gmail search query selecting the messages to sort"),
+  maxMessages: z.number().int().min(1).max(MAX_TRIAGE_MESSAGES).optional().default(100).describe("Maximum messages to examine in this plan (1-500)"),
+  rules: z.array(TriageRuleSchema).max(MAX_TRIAGE_RULES).optional().describe("Rules to match. Omit to use the stored set from triage_set_rules."),
+  shadowMode: z.boolean().optional().default(false).describe("Plan labels only — drop every archive and mark-read. Use it to try a new rule set safely."),
+  includeUnmatched: z.boolean().optional().default(false).describe("List the messages no rule matched, with no action, so gaps in the rule set are visible"),
+});
+
+export const TriagePreviewSchema = z.object({
+  runId: runIdString().describe("Run id returned by triage_plan"),
+  maxItems: z.number().int().min(1).max(MAX_TRIAGE_MESSAGES).optional().default(50).describe("Maximum per-message rows to include (default 50)"),
+  rule: z.string().min(1).max(MAX_FILENAME_LENGTH).optional().describe("Show only the messages claimed by this rule"),
+});
+
+export const TriageApplySchema = z.object({
+  runId: runIdString().describe("Run id returned by triage_plan"),
+  messageIds: z.array(idString()).max(MAX_TRIAGE_MESSAGES).optional().describe("Apply only these messages"),
+  rules: z.array(z.string().min(1).max(MAX_FILENAME_LENGTH)).max(MAX_TRIAGE_RULES).optional().describe("Apply only the messages claimed by these rules — the way to roll out one rule at a time"),
+  dryRun: z.boolean().optional().default(false).describe("Report what would be applied without calling Gmail"),
+});
+
+export const TriageRollbackSchema = z.object({
+  runId: runIdString().describe("Run id to reverse. Removes the labels the run added and restores the ones it removed."),
+});
+
+export const TriageListRunsSchema = z.object({
+  limit: z.number().int().min(1).max(100).optional().default(20).describe("How many recent runs to list (default 20)"),
+});
+
+export const TriageGetRulesSchema = z.object({});
+
+export const TriageSetRulesSchema = z.object({
+  rules: z.array(TriageRuleSchema).max(MAX_TRIAGE_RULES).describe("The complete rule set; replaces whatever is stored. Pass [] to clear."),
+});
+
 // Tool definition type
 export interface ToolAnnotations {
   title: string;
@@ -550,6 +626,62 @@ export const toolDefinitions: ToolDefinition[] = [
     schema: ForwardEmailSchema,
     scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
     annotations: { title: "Forward Email", destructiveHint: false },
+  },
+
+  // Triage (rule-based mail sorting)
+  //
+  // Split into plan / preview / apply / rollback rather than one "sort my
+  // mail" tool. Planning is read-only and produces a file listing exactly
+  // which labels would move; only a separate call turns that into changes,
+  // and a third reverses it.
+  {
+    name: "triage_plan",
+    description: "Matches messages against the triage rule set and writes a plan. Reads message HEADERS only (sender, subject, List-Id, labels) — never a body. Mutates nothing; returns a run id for triage_preview / triage_apply. Unlike create_filter, this works on mail that is already in the mailbox.",
+    schema: TriagePlanSchema,
+    scopes: ["gmail.readonly", "gmail.modify"],
+    annotations: { title: "Triage: Plan", readOnlyHint: true },
+  },
+  {
+    name: "triage_preview",
+    description: "Summarizes a plan: how many messages each rule claimed, which labels they would get, and the per-message detail. Reads the local run file only.",
+    schema: TriagePreviewSchema,
+    scopes: ["gmail.readonly", "gmail.modify"],
+    annotations: { title: "Triage: Preview", readOnlyHint: true },
+  },
+  {
+    name: "triage_apply",
+    description: "Applies a plan's label changes to Gmail. Only ever adds or removes labels (archive = remove INBOX, mark read = remove UNREAD); it cannot delete, send or forward. Narrow the rollout with `rules` or `messageIds`.",
+    schema: TriageApplySchema,
+    scopes: ["gmail.modify"],
+    annotations: { title: "Triage: Apply", destructiveHint: true, idempotentHint: true },
+  },
+  {
+    name: "triage_rollback",
+    description: "Reverses an applied plan — removes the labels it added and restores the ones it removed. Reverses only the plan's own changes, so edits made since are left alone.",
+    schema: TriageRollbackSchema,
+    scopes: ["gmail.modify"],
+    annotations: { title: "Triage: Roll Back", destructiveHint: true, idempotentHint: true },
+  },
+  {
+    name: "triage_list_runs",
+    description: "Lists recent triage runs, newest first.",
+    schema: TriageListRunsSchema,
+    scopes: ["gmail.readonly", "gmail.modify"],
+    annotations: { title: "Triage: List Runs", readOnlyHint: true },
+  },
+  {
+    name: "triage_get_rules",
+    description: "Returns the stored triage rule set.",
+    schema: TriageGetRulesSchema,
+    scopes: ["gmail.readonly", "gmail.modify"],
+    annotations: { title: "Triage: Get Rules", readOnlyHint: true },
+  },
+  {
+    name: "triage_set_rules",
+    description: "Replaces the stored triage rule set. Rules match on sender, sender domain, subject, List-Id, List-Unsubscribe and existing labels — no regular expressions, no message bodies.",
+    schema: TriageSetRulesSchema,
+    scopes: ["gmail.modify", "gmail.labels"],
+    annotations: { title: "Triage: Set Rules", destructiveHint: true, idempotentHint: true },
   },
 ];
 
