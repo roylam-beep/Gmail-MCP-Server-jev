@@ -36,11 +36,28 @@ function collectSources(dir: string): string[] {
 }
 
 describe('stdout purity', () => {
-    const sources = collectSources(SRC_DIR);
+    /**
+     * setup-wizard.ts is a CLI the user runs by hand; stdout is its output, not
+     * a protocol stream. The exemption is narrow on purpose and the test below
+     * enforces that it stays narrow: if the server ever imported it, its
+     * console.log would land in the JSON-RPC stream and this rule would have
+     * been quietly voided.
+     */
+    const CLI_ONLY = new Set(['setup-wizard.ts']);
+
+    const sources = collectSources(SRC_DIR).filter(f => !CLI_ONLY.has(path.basename(f)));
 
     it('covers every source file', () => {
         expect(sources.length).toBeGreaterThan(0);
         expect(sources.map(f => path.basename(f))).toContain('index.ts');
+    });
+
+    it('the stdout-writing CLI is never pulled into the server', () => {
+        const server = fs.readFileSync(path.join(SRC_DIR, 'index.ts'), 'utf8');
+        for (const cli of CLI_ONLY) {
+            const moduleName = cli.replace(/\.ts$/, '');
+            expect(server).not.toMatch(new RegExp(`from ['"]\\./${moduleName}\\.js['"]`));
+        }
     });
 
     for (const file of sources) {
