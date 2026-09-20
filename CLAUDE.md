@@ -10,5 +10,10 @@ See `.claude/skills/pr-review-sop/SKILL.md` for the full SOP.
 - The README gate applies only to non-test files under `src/`.
 - This is a fork of `ArtyMcLabin/Gmail-MCP-Server` (itself a fork of `GongRzhe/Gmail-MCP-Server`), published as `@geniushub/gmail-mcp`.
 
+## Picking up this project
+Read `HANDOVER.md` first. It carries the current state, the one task that
+actually blocks use, what is deliberately deferred and why, and the traps that
+cost time in the last session.
+
 ## PR & Issue Review
 Mandatory security audit on every PR before presenting. See `.claude/skills/pr-review-sop/SKILL.md`.
