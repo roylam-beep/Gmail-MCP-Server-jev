@@ -20,13 +20,23 @@ import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, Gm
 import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader, buildReplyAllRecipients } from "./reply-all-helpers.js";
 import { addFwdPrefix, collectForwardAttachments, assertForwardAttachmentsWithinLimit, buildForwardedTextBody, buildForwardedHtmlBody } from "./forward-helpers.js";
 import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
-import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ForwardEmailSchema } from "./tools.js";
+import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ForwardEmailSchema, TriagePlanSchema, TriagePreviewSchema, TriageApplySchema, TriageRollbackSchema, TriageListRunsSchema, TriageGetRulesSchema, TriageSetRulesSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 import { resolveToolPrefix } from "./tool-prefix.js";
 import { sanitizeFilename, fallbackAttachmentName, resolveWithinDirectory } from "./filename-utils.js";
 import { processItemsIndividually, processBatchesWithFallback, mapWithConcurrency } from "./batch-utils.js";
 import { extractEmailContent, extractAttachments, findAttachmentFilename, GmailMessagePart } from "./mime-utils.js";
 import { ensureSecureDirFor, hardenFilePermissions, writeSecretJsonAtomic } from "./secure-store.js";
+import { loadRuleSet, validateRuleSet, TriageRule, TriageRuleSet } from "./triage-rules.js";
+import {
+    planTriage,
+    applyRun,
+    rollbackRun,
+    loadRun,
+    listRuns,
+    summarizeRun,
+    ensureRunsDir,
+} from "./triage-manager.js";
 
 // stdout is reserved for the MCP JSON-RPC stream (StdioServerTransport).
 // Anything written there that is not a protocol frame corrupts the session for
@@ -39,6 +49,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_DIR = path.join(os.homedir(), '.gmail-mcp');
 const OAUTH_PATH = process.env.GMAIL_OAUTH_PATH || path.join(CONFIG_DIR, 'gcp-oauth.keys.json');
 const CREDENTIALS_PATH = process.env.GMAIL_CREDENTIALS_PATH || path.join(CONFIG_DIR, 'credentials.json');
+// Triage state. The rule file is user-authored config; the run files hold
+// subjects and sender addresses for real mail, so both live under the same
+// owner-only config directory as the credentials.
+const TRIAGE_RULES_PATH = process.env.GMAIL_TRIAGE_RULES_PATH || path.join(CONFIG_DIR, 'triage-rules.json');
+const TRIAGE_RUNS_DIR = process.env.GMAIL_TRIAGE_RUNS_DIR || path.join(CONFIG_DIR, 'triage-runs');
 
 // Optional tool-name prefix — lets multiple instances of this server run side-by-side
 // without their tool names colliding in clients that disambiguate by base name.
@@ -1851,6 +1866,165 @@ async function main() {
                                 text: `Thread ${validatedArgs.threadId} labels updated successfully (all messages in thread modified)`,
                             },
                         ],
+                    };
+                }
+
+                case "triage_plan": {
+                    const validatedArgs = TriagePlanSchema.parse(args);
+
+                    // An explicit `rules` argument overrides the stored set for
+                    // this plan only — handy for trying a rule before storing it.
+                    const rules: TriageRule[] = validatedArgs.rules ?? loadRuleSet(TRIAGE_RULES_PATH).rules;
+                    if (rules.length === 0) {
+                        throw new Error('No triage rules to match. Store a rule set with triage_set_rules, or pass `rules` directly.');
+                    }
+
+                    ensureRunsDir(TRIAGE_RUNS_DIR);
+                    const run = await planTriage(gmail, TRIAGE_RUNS_DIR, {
+                        query: validatedArgs.query,
+                        maxMessages: validatedArgs.maxMessages,
+                        rules,
+                        shadowMode: validatedArgs.shadowMode,
+                        includeUnmatched: validatedArgs.includeUnmatched,
+                    });
+
+                    const summary = summarizeRun(run);
+                    const ruleLines = Object.entries(summary.byRule)
+                        .sort((a, b) => b[1] - a[1])
+                        .map(([rule, count]) => `  ${rule}: ${count}`);
+                    const labelLines = Object.entries(summary.byLabel)
+                        .sort((a, b) => b[1] - a[1])
+                        .map(([label, count]) => `  ${label}: ${count}`);
+
+                    let text = `Triage plan ${run.runId}\n`;
+                    text += `Query: ${run.query} | Mode: ${run.shadowMode ? 'shadow (labels only)' : 'live'}\n`;
+                    text += `Matched: ${summary.matched} | Unmatched: ${summary.unmatched} | Would archive: ${summary.archive}\n`;
+                    text += ruleLines.length > 0 ? `\nBy rule:\n${ruleLines.join('\n')}\n` : '\nNo rule matched anything.\n';
+                    if (labelLines.length > 0) text += `\nLabels to apply:\n${labelLines.join('\n')}\n`;
+                    text += `\nNothing has been changed in Gmail. Inspect with triage_preview, then apply with triage_apply.`;
+
+                    return { content: [{ type: "text", text }] };
+                }
+
+                case "triage_preview": {
+                    const validatedArgs = TriagePreviewSchema.parse(args);
+                    const run = loadRun(TRIAGE_RUNS_DIR, validatedArgs.runId);
+                    const summary = summarizeRun(run);
+
+                    const filtered = validatedArgs.rule
+                        ? run.items.filter(item => item.ruleName === validatedArgs.rule)
+                        : run.items;
+                    const items = filtered.slice(0, validatedArgs.maxItems);
+
+                    let text = `Run ${run.runId} (${run.createdAt})\n`;
+                    text += `Query: ${run.query} | Mode: ${run.shadowMode ? 'shadow' : 'live'}\n`;
+                    text += `Listed ${summary.total} | matched ${summary.matched} | unmatched ${summary.unmatched} | archive ${summary.archive} | already applied ${summary.applied}\n`;
+                    if (run.appliedAt) text += `Applied at: ${run.appliedAt}\n`;
+                    if (run.rolledBackAt) text += `Rolled back at: ${run.rolledBackAt}\n`;
+                    text += `\nShowing ${items.length} of ${filtered.length}:\n`;
+
+                    for (const item of items) {
+                        const plan = [
+                            item.actions.addLabels.length > 0 ? `+${item.actions.addLabels.join(' +')}` : '',
+                            item.actions.removeLabels?.length ? `-${item.actions.removeLabels.join(' -')}` : '',
+                            item.actions.archive ? 'archive' : '',
+                            item.actions.markRead ? 'mark-read' : '',
+                        ].filter(Boolean).join(' ') || 'no action';
+                        text += `\n[${item.ruleName ?? 'unmatched'}] ${item.messageId}\n`;
+                        text += `  from: ${item.from}\n`;
+                        text += `  subject: ${item.subject}\n`;
+                        text += `  plan: ${plan}\n`;
+                        if (item.applied && !item.rolledBackAt) text += `  applied: ${item.applied.at}\n`;
+                        if (item.rolledBackAt) text += `  rolled back: ${item.rolledBackAt}\n`;
+                    }
+
+                    return { content: [{ type: "text", text }] };
+                }
+
+                case "triage_apply": {
+                    const validatedArgs = TriageApplySchema.parse(args);
+                    const run = loadRun(TRIAGE_RUNS_DIR, validatedArgs.runId);
+
+                    const result = await applyRun(gmail, TRIAGE_RUNS_DIR, run, {
+                        onlyMessageIds: validatedArgs.messageIds,
+                        onlyRules: validatedArgs.rules,
+                        dryRun: validatedArgs.dryRun,
+                    });
+
+                    let text = validatedArgs.dryRun
+                        ? `Dry run for ${run.runId}: ${run.items.length - result.skipped} message(s) would be modified, ${result.skipped} skipped. Nothing was changed.\n`
+                        : `Applied run ${run.runId}: ${result.applied} message(s) modified, ${result.skipped} skipped.\n`;
+
+                    if (result.failures.length > 0) {
+                        text += `\nFailed: ${result.failures.length}\n`;
+                        text += result.failures.map(f => `- ${f.messageId}: ${f.error}`).join('\n');
+                        text += '\n';
+                    }
+                    if (!validatedArgs.dryRun && result.applied > 0) {
+                        text += `\nReverse with triage_rollback { "runId": "${run.runId}" }.`;
+                    }
+
+                    return { content: [{ type: "text", text }] };
+                }
+
+                case "triage_rollback": {
+                    const validatedArgs = TriageRollbackSchema.parse(args);
+                    const run = loadRun(TRIAGE_RUNS_DIR, validatedArgs.runId);
+                    const result = await rollbackRun(gmail, TRIAGE_RUNS_DIR, run);
+
+                    let text = result.reverted === 0
+                        ? `Run ${run.runId} has nothing left to reverse.`
+                        : `Reversed ${result.reverted} message(s) from run ${run.runId}.`;
+                    if (result.failures.length > 0) {
+                        text += `\n\nFailed: ${result.failures.length}\n`;
+                        text += result.failures.map(f => `- ${f.messageId}: ${f.error}`).join('\n');
+                    }
+
+                    return { content: [{ type: "text", text }] };
+                }
+
+                case "triage_list_runs": {
+                    const validatedArgs = TriageListRunsSchema.parse(args);
+                    const runs = listRuns(TRIAGE_RUNS_DIR, validatedArgs.limit);
+
+                    const text = runs.length === 0
+                        ? 'No triage runs recorded yet. Start with triage_plan.'
+                        : runs.map(run => `${run.runId}  (${run.modifiedAt})`).join('\n');
+
+                    return { content: [{ type: "text", text }] };
+                }
+
+                case "triage_get_rules": {
+                    TriageGetRulesSchema.parse(args ?? {});
+                    const ruleSet = loadRuleSet(TRIAGE_RULES_PATH);
+
+                    const text = ruleSet.rules.length === 0
+                        ? `No triage rules stored (${TRIAGE_RULES_PATH}).`
+                        : JSON.stringify(ruleSet, null, 2);
+
+                    return { content: [{ type: "text", text }] };
+                }
+
+                case "triage_set_rules": {
+                    const validatedArgs = TriageSetRulesSchema.parse(args);
+                    const ruleSet: TriageRuleSet = { version: 1, rules: validatedArgs.rules };
+
+                    // The zod schema bounds the shape; validateRuleSet catches
+                    // the semantic mistakes it cannot see — a duplicate name, or
+                    // a rule with no conditions that would match everything.
+                    const problems = validateRuleSet(ruleSet);
+                    if (problems.length > 0) {
+                        throw new Error(`Rule set rejected: ${problems.join('; ')}`);
+                    }
+
+                    ensureSecureDirFor(TRIAGE_RULES_PATH);
+                    writeSecretJsonAtomic(TRIAGE_RULES_PATH, ruleSet);
+
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Stored ${ruleSet.rules.length} triage rule(s) in ${TRIAGE_RULES_PATH}.`,
+                        }],
                     };
                 }
 

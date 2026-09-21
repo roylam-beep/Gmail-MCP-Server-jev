@@ -39,6 +39,7 @@ There's a downstream fork that took this in the **maximalist** direction. I'm no
 - **Durable OAuth sessions** - `refresh_token` is persisted across restarts, ending the hourly re-auth loop ([PR #35](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/35) by [@BrentBaccala](https://github.com/BrentBaccala))
 - **Custom OAuth callback port** - the auth listener derives port and path from your callback URL instead of hardcoding 3000 ([PR #41](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/41) by [@soapergem](https://github.com/soapergem))
 - **Safe permanent-delete gating** - `delete_email`/`batch_delete_emails` require the opt-in `gmail.full` scope (which also satisfies all other mail scopes), so default auth stays least-privilege ([PR #39](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/39) by [@caioribeiroclw-pixel](https://github.com/caioribeiroclw-pixel))
+- **Retroactive mail sorting** - `triage_plan` / `triage_preview` / `triage_apply` / `triage_rollback` sort mail that is *already* in the mailbox, which Gmail's own filters cannot do (they only ever see incoming mail). Rules match on headers only, planning is read-only, and every change is a reversible label change
 
 All features are production-tested in daily use.
 
@@ -294,6 +295,9 @@ The server automatically filters available tools based on your authorized scopes
 | `delete_email`, `batch_delete_emails` | `gmail.full` (`https://mail.google.com/`) |
 | `create_label`, `update_label`, `delete_label`, `get_or_create_label` | `gmail.modify` or `gmail.labels` |
 | `list_filters`, `get_filter`, `create_filter`, `delete_filter`, `create_filter_from_template` | `gmail.settings.basic` |
+| `triage_plan`, `triage_preview`, `triage_list_runs`, `triage_get_rules` | `gmail.readonly` or `gmail.modify` |
+| `triage_apply`, `triage_rollback` | `gmail.modify` |
+| `triage_set_rules` | `gmail.modify` or `gmail.labels` |
 
 `gmail.full` is intentionally separate from the default scopes because it grants permanent-delete capability. Prefer `modify_email` / `batch_modify_emails` for archive, mark-read, label, or inbox cleanup flows; re-authenticate with `--scopes=gmail.full,gmail.settings.basic` only when the assistant should be able to permanently delete mail. `gmail.full` is a superset of the other mail scopes, so that combination keeps every read/send/modify/label tool available (settings scopes remain separate - Gmail's filter endpoints only accept `gmail.settings.*`).
 
@@ -810,6 +814,100 @@ Parameters:
 - `includeAttachments` (optional, default `true`): Carry the original's attachments and inline images over
 
 Attachments are buffered in memory while the message is assembled, so the combined size is capped at 25 MB (Gmail's own send ceiling). Above that the tool fails with a clear error rather than an opaque API rejection; use `includeAttachments: false` to forward the text alone.
+
+### 28-34. Triage: sorting mail that is already in the mailbox
+
+Gmail's own filters (`create_filter` above) only ever see **incoming** mail. A filter created today does nothing about the thousand messages already sitting in the inbox. The triage tools are the retroactive half: the same kind of condition, matched locally against messages a query already selected.
+
+**What it reads.** Message *headers* only — sender, subject, `List-Id`, `List-Unsubscribe`, existing labels. No message body is ever fetched, decoded or inspected. Planning uses Gmail's `metadata` format, which costs 1 quota unit per message instead of the 5 a full fetch costs.
+
+**What it can do.** Add and remove labels. That is the whole surface. Archiving is "remove `INBOX`" and marking read is "remove `UNREAD`" — both are label changes too. There is no code path that deletes, sends or forwards, so a wrong rule costs you a stray label, never a message.
+
+#### The loop
+
+```
+triage_set_rules   store the rule set once
+triage_plan        match a query against it -> run id   (read-only)
+triage_preview     read the plan before anything moves  (read-only)
+triage_apply       apply it, all at once or one rule at a time
+triage_rollback    reverse exactly what the run changed
+```
+
+#### Defining rules (`triage_set_rules`)
+
+```json
+{
+  "rules": [
+    {
+      "name": "ahrefs-audits",
+      "when": { "fromDomain": ["ahrefs.com"] },
+      "actions": { "addLabels": ["Ahrefs/Audits"], "archive": true }
+    },
+    {
+      "name": "ad-receipts",
+      "when": { "fromDomain": ["meta.com", "facebookmail.com"], "subjectContains": ["receipt", "收據"] },
+      "actions": { "addLabels": ["Finance/Ad-Receipts"] }
+    },
+    {
+      "name": "bulk-mail",
+      "when": { "hasListUnsubscribe": true, "lacksLabel": ["Finance/Ad-Receipts"] },
+      "actions": { "addLabels": ["Read-Later/Newsletter"], "archive": true }
+    }
+  ]
+}
+```
+
+**Conditions** — values within a field are OR'd, fields are AND'd. A rule with **no** conditions never matches, so a half-written rule cannot become a catch-all that relabels the whole mailbox.
+
+| Field | Matches |
+|-------|---------|
+| `fromEquals` | Exact sender address, case-insensitive |
+| `fromDomain` | The domain and any subdomain of it — `ahrefs.com` matches `mail.ahrefs.com` but **not** `notahrefs.com` |
+| `fromContains` | Substring of the sender display name or address |
+| `subjectContains` | Substring of the subject, case-insensitive |
+| `listIdContains` | Substring of `List-Id` — the reliable way to catch one specific mailing list |
+| `hasListUnsubscribe` | `true` catches bulk mail generically; `false` catches everything that is not bulk |
+| `hasLabel` | Any of these label names is present |
+| `lacksLabel` | **All** of these label names are absent — use it to stop a rule re-running on mail it already sorted |
+
+No regular expressions, deliberately: a rule set may be written by an assistant that has just read untrusted mail, and a pattern is an easy thing for that mail to influence. Substring and suffix tests have no pathological input.
+
+**Actions:** `addLabels` (names, created on demand), `removeLabels`, `archive`, `markRead`. Rules are matched in order and the first one wins, so put the specific rules above the broad ones.
+
+#### Planning and applying
+
+```
+triage_plan    { "query": "in:inbox is:unread", "maxMessages": 200 }
+triage_preview { "runId": "run-...", "rule": "bulk-mail" }
+triage_apply   { "runId": "run-...", "rules": ["ahrefs-audits"] }
+```
+
+- `shadowMode: true` on `triage_plan` drops every `archive` and `markRead` from the plan — you get the labels and the full run record without anything leaving the inbox. Run a new rule set this way first.
+- `includeUnmatched: true` lists the messages no rule claimed, so the gaps in your rule set are visible rather than silent.
+- `dryRun: true` on `triage_apply` reports what would change without calling Gmail.
+- `rules: [...]` or `messageIds: [...]` on `triage_apply` narrows the rollout to one rule or a hand-picked set.
+- `triage_rollback` reverses the **delta the run issued**, not a snapshot — anything you changed on those messages in the meantime is left alone. A rolled-back run can be applied again.
+
+#### Where state lives
+
+| Path | Contents | Mode |
+|------|----------|------|
+| `~/.gmail-mcp/triage-rules.json` | Your rule set | `0600` |
+| `~/.gmail-mcp/triage-runs/*.json` | Run records (message ids, senders, truncated subjects, applied deltas) | `0600` |
+
+Both are overridable with `GMAIL_TRIAGE_RULES_PATH` and `GMAIL_TRIAGE_RUNS_DIR`. Run files hold real mail metadata, so they get the same owner-only treatment as the credential file, and the 50 most recent are kept — older ones are pruned automatically.
+
+#### Triage vs. Gmail filters
+
+| | `create_filter` | `triage_*` |
+|---|---|---|
+| Existing mail | ❌ never | ✅ that is the point |
+| Incoming mail | ✅ automatic, server-side | ❌ only when you run it |
+| Runs without the assistant | ✅ | ❌ |
+| Preview before applying | ❌ | ✅ |
+| Reversible | ❌ | ✅ `triage_rollback` |
+
+They complement each other: use `triage_*` to clean up the backlog and to try a rule on real mail, then `create_filter` to make the rule you settled on run automatically on new mail.
 
 ## Filter Management Features
 
